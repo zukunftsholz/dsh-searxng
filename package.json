@@ -54,7 +54,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rogerdigital/dsh-searxng.git"
+    "url": "git+https://github.com/zukunftsholz/dsh-searxng.git"
   },
   "engines": {
     "node": ">=20"

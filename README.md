@@ -2,6 +2,12 @@
 
 [![dsh-vet](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Frogerdigital%2Fdsh-searxng%2Fdsh-vet%2Freport%2F.dsh-vet%2Fbadge.json)](https://github.com/rogerdigital/dsh-searxng/blob/dsh-vet/report/.dsh-vet/report.json)
 
+> **This is a fork.** Upstream is [rogerdigital/dsh-searxng](https://github.com/rogerdigital/dsh-searxng),
+> by Roger Deng, MIT-licensed. This fork ports the plugin to DeepSeek Harness **0.2.1-rc.2** and
+> makes the deployment mode an explicit choice; it is published from
+> [zukunftsholz/dsh-searxng](https://github.com/zukunftsholz/dsh-searxng). The `dsh-vet` badge above
+> reports upstream's independent-audit branch, which this fork does not publish.
+
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) plugin that registers a
 [SearXNG](https://docs.searxng.org/)-backed search provider into the web capability seam
 (`ctx.web`), giving your agent `web_search` through a **free, self-hosted, key-less** metasearch
