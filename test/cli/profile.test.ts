@@ -1,10 +1,13 @@
 import type { FileHandle } from 'node:fs/promises'
 import * as fs from 'node:fs/promises'
+import * as fsSync from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parse, parseDocument } from 'yaml'
 import { afterEach, describe, expect, it } from 'vitest'
+import { PLUGIN_NAME, PLUGIN_SPEC_ENV } from '../../src/cli/bundle.ts'
 import { CliError } from '../../src/cli/errors.ts'
+import { symlinkTestTitle, symlinkUnsupported } from './symlink-capability.ts'
 import type { CommandResult, CommandRunner } from '../../src/cli/process.ts'
 import {
   NodeProfileManager,
@@ -13,6 +16,16 @@ import {
 } from '../../src/cli/profile.ts'
 
 const roots: string[] = []
+
+/**
+ * The install spec the fixture's manager passes to `dsh plugin add`.
+ *
+ * Deliberately not the real pinned spec: these assertions should not start
+ * failing every time `package.json`'s version changes. The "pinned to the
+ * running package's own version" behaviour is covered by its own tests against
+ * `resolvePluginSpec`/`readSelfPackage`.
+ */
+const TEST_PLUGIN_SPEC = 'dsh-searxng@test'
 
 class RecordingRunner implements CommandRunner {
   readonly calls: Array<{ command: string; args: readonly string[] }> = []
@@ -40,36 +53,84 @@ class RecordingRunner implements CommandRunner {
       : this.response
     if (response.exitCode === 0 && this.profileDir !== undefined && this.simulatePluginEffects) {
       const manifestPath = join(this.profileDir, 'package.json')
-      let manifest: { dependencies?: Record<string, string> } = {}
+      let manifest: {
+        dependencies?: Record<string, string>
+        dsh?: { profile?: { bundles?: string[]; [key: string]: unknown }; [key: string]: unknown }
+      } = {}
       try {
         manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as typeof manifest
       } catch {}
       manifest.dependencies ??= {}
-      if (args.includes('add')) manifest.dependencies['dsh-searxng'] = '0.1.1'
-      if (args.includes('remove')) delete manifest.dependencies['dsh-searxng']
+      // Mirrors what `dsh plugin add|remove` actually does: plugin-manager's
+      // `reconcile()` keeps `dsh.profile.bundles` in step with `dependencies`,
+      // appending a newly installed bundle and dropping one whose dependency is
+      // gone. Without the removal half, uninstall would look like it left a
+      // stale bundle entry behind.
+      const bundles = manifest.dsh?.profile?.bundles ?? []
+      if (args.includes('add')) {
+        manifest.dependencies['dsh-searxng'] = '0.1.1'
+        if (!bundles.includes('dsh-searxng')) {
+          manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles: [...bundles, 'dsh-searxng'] } }
+        }
+      }
+      if (args.includes('remove')) {
+        delete manifest.dependencies['dsh-searxng']
+        manifest.dsh = {
+          ...manifest.dsh,
+          profile: { ...manifest.dsh?.profile, bundles: bundles.filter((name) => name !== 'dsh-searxng') },
+        }
+      }
       await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
     }
     return response
   }
 }
 
+/**
+ * Materialize a profile fixture.
+ *
+ * By default the fixture installs a stand-in `dsh-searxng` package carrying the
+ * bundle patch this repo ships, and enrols it in `dsh.profile.bundles`, so the
+ * profile is in the state `attach` now verifies: the config row resolves
+ * because the bundle layer inserts the entry it targets. `bundle` overrides
+ * that shape for the composition tests, which need the row to be unmountable.
+ *
+ * `reconcileBundles: false` suppresses the automatic enrolment so a test can
+ * express the exact defective profile found on a real machine — the plugin
+ * present in `dependencies` but absent from `dsh.profile.bundles`. That state is
+ * unreachable through `dsh plugin add` (plugin-manager's `reconcile()` appends
+ * the bundle), but entirely reachable by hand-editing the manifest, which is how
+ * it happened. Only the test that pins that failure mode should use it.
+ */
 async function fixture(options: {
   packageJson?: unknown | string
   patch?: string
   fileSystem?: ProfileFileSystem
   runner?: RecordingRunner
+  bundle?: BundleShape | null
+  /** Set false to keep `dsh.profile.bundles` exactly as the fixture declares it. */
+  reconcileBundles?: boolean
+  /** Overrides the install spec the manager passes to `dsh plugin add`. */
+  pluginSpec?: string
 } = {}) {
   const dshHome = await fs.mkdtemp(join(tmpdir(), 'dsh-profile-'))
   roots.push(dshHome)
   const dir = join(dshHome, 'profiles', 'web')
   await fs.mkdir(dir, { recursive: true })
   if (options.packageJson !== undefined) {
-    const source = typeof options.packageJson === 'string'
+    // Object manifests get the enrolled shape `dsh plugin add` produces, while
+    // raw-string manifests stay byte-exact: the concurrency tests assert on the
+    // exact bytes they wrote, and rewriting one would invalidate the fixture.
+    const value = typeof options.packageJson === 'string'
       ? options.packageJson
-      : `${JSON.stringify(options.packageJson, null, 2)}\n`
+      : options.reconcileBundles === false
+        ? options.packageJson
+        : enrolledManifest(options.packageJson)
+    const source = typeof value === 'string' ? value : `${JSON.stringify(value, null, 2)}\n`
     await fs.writeFile(join(dir, 'package.json'), source)
   }
   if (options.patch !== undefined) await fs.writeFile(join(dir, 'cordis.patch.yml'), options.patch)
+  if (options.bundle !== null) installBundle(dir, options.bundle)
   const runner = options.runner ?? new RecordingRunner()
   runner.profileDir = dir
   const manager = new NodeProfileManager({
@@ -77,9 +138,71 @@ async function fixture(options: {
     dshHome,
     fileSystem: options.fileSystem,
     randomId: () => 'fixed',
+    // Pin the spec explicitly so these assertions never depend on the version
+    // in package.json. The pinned-to-own-version behaviour has its own tests.
+    pluginSpec: options.pluginSpec ?? TEST_PLUGIN_SPEC,
   })
   return { dshHome, dir, patchPath: join(dir, 'cordis.patch.yml'), manager, runner }
 }
+
+/** Bundle-layer shapes the composition observer distinguishes. */
+type BundleShape =
+  /** The shipped shape: inserts the entry the profile config targets. */
+  | 'shipped'
+  /** Installed but declares no `dsh.bundle`. */
+  | 'no-metadata'
+  /** Bundle layer inserts a different id, so the targeted row cannot resolve. */
+  | 'other-id'
+  /** Bundle patch file is not valid YAML. */
+  | 'unreadable'
+
+/**
+ * Install a stand-in plugin package with a chosen bundle shape. `attach` reads
+ * this package's manifest and patch file, so the fixture has to look like a
+ * real installation rather than only a manifest dependency.
+ * @param dir - absolute profile directory.
+ * @param shape - which bundle layer to materialize.
+ */
+function installBundle(dir: string, shape: BundleShape = 'shipped'): void {
+  const bundleDir = join(dir, 'node_modules', 'dsh-searxng')
+  fsSync.mkdirSync(bundleDir, { recursive: true })
+  const manifest: Record<string, unknown> = { name: 'dsh-searxng', version: '0.5.0' }
+  if (shape !== 'no-metadata') manifest.dsh = { bundle: { patch: './cordis.patch.yml' } }
+  fsSync.writeFileSync(join(bundleDir, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+  if (shape === 'no-metadata') return
+  const patch = shape === 'other-id'
+    ? "- insert:\n    - id: another-entry\n"
+    : shape === 'unreadable'
+      ? '[unbalanced\n'
+      : "- insert:\n    - id: web-search-searxng\n      name: 'dsh-searxng'\n"
+  fsSync.writeFileSync(join(bundleDir, 'cordis.patch.yml'), patch)
+}
+
+/**
+ * Enrol the plugin package as a profile bundle, the way `dsh plugin add`
+ * reconciles it.
+ *
+ * This is what makes the config row resolvable: the shipped `cordis.patch.yml`
+ * is a bundle layer whose `insert` creates the `web-search-searxng` entry, and
+ * only an enrolled bundle is applied. A manifest that lists the dependency but
+ * not the bundle is the silently-broken shape the CLI now refuses to produce,
+ * so fixtures that exist to exercise other behaviour start from a working
+ * profile instead of inheriting that defect.
+ * @param manifest - a fixture manifest with a `dependencies` map.
+ * @returns a copy whose `dsh.profile.bundles` lists the plugin, when the
+ *   fixture is one where the plugin is meant to be installed.
+ */
+function enrolledManifest(manifest: unknown): unknown {
+  if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)) return manifest
+  const record = manifest as Record<string, unknown>
+  if (!record.dependencies || !Object.hasOwn(record.dependencies, 'dsh-searxng')) return manifest
+  const dsh = (record.dsh ?? {}) as Record<string, unknown>
+  const profile = (dsh.profile ?? {}) as Record<string, unknown>
+  const bundles = Array.isArray(profile.bundles) ? profile.bundles as string[] : []
+  if (bundles.includes('dsh-searxng')) return manifest
+  return { ...record, dsh: { ...dsh, profile: { ...profile, bundles: [...bundles, 'dsh-searxng'] } } }
+}
+
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })))
@@ -126,6 +249,9 @@ describe('ProfileManager contract and discovery', () => {
         engines: 'bing,google',
         categories: 'general',
         authHeader: 'Bearer private-token',
+        // The preview reports the config this CLI would WRITE, and every write
+        // records the mode explicitly rather than relying on the schema default.
+        mode: 'external',
       },
       current: {
         baseURL: 'http://old.invalid',
@@ -134,6 +260,7 @@ describe('ProfileManager contract and discovery', () => {
         categories: 'general',
         authHeader: 'Bearer private-token',
       },
+      mount: { enrolled: true, composes: true, observable: true },
     })
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(patch)
   })
@@ -309,6 +436,213 @@ describe('ProfileManager contract and discovery', () => {
   })
 })
 
+/**
+ * A profile can carry the `web-search-searxng` config row while its bundle
+ * layer never inserts that entry. `applyEntryPatches` resolves a non-insert
+ * patch by id against entries that already exist and drops a miss with only a
+ * loader warning, so the provider silently never registers and a configured
+ * `web.searchProvider: searxng` fails at search time with
+ * WEB_PROVIDER_CONFIGURED_MISSING. These tests pin both halves of the reply:
+ * `attach` repairs and then proves the bundle layer, and `preview` reports it.
+ */
+describe('bundle layer enrollment', () => {
+  const rowPatch = `- id: web-search-searxng
+  config:
+    baseURL: http://127.0.0.1:8080
+`
+
+  it('enrols an installed but unenrolled plugin before writing the config row', async () => {
+    const { manager, dir, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } },
+      patch: '[]\n',
+    })
+    const manifestPath = join(dir, 'package.json')
+
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as {
+      dependencies: Record<string, string>
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(manifest.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', 'dsh-searxng'])
+    // Unrelated manifest fields survive the enrollment write.
+    expect(manifest.dependencies).toEqual({ 'dsh-searxng': '0.5.0' })
+    expect(ids(await fs.readFile(patchPath, 'utf8'))).toEqual(['web-search-searxng'])
+  })
+
+  it('reports the enrolled and composed profile in a preview', async () => {
+    const { manager } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' } },
+      patch: rowPatch,
+    })
+    await expect(manager.preview('web', 'http://127.0.0.1:8080')).resolves.toMatchObject({
+      installed: true,
+      mount: { enrolled: true, composes: true, observable: true },
+    })
+  })
+
+  it('reports an unenrolled profile as a proven composition failure', async () => {
+    // This is the exact defective profile found on a real machine: the plugin is
+    // installed (so it is in `dependencies`), the config row targets its entry,
+    // but nothing lists it in `dsh.profile.bundles`, so the bundle layer is
+    // never applied, the insert never happens, and the row is silently skipped.
+    // `reconcileBundles: false` is required precisely because `dsh plugin add`
+    // would have enrolled it — this state comes from a hand-edited manifest.
+    const created = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: [] } } },
+      patch: rowPatch,
+      reconcileBundles: false,
+    })
+    await expect(created.manager.preview('web', 'http://127.0.0.1:8080')).resolves.toMatchObject({
+      mount: { enrolled: false, composes: false, reason: 'not-enrolled', observable: true },
+    })
+    // The manifest really is in that shape, and the row really is present:
+    // presence without enrolment is what makes the silent skip dangerous.
+    expect(JSON.parse(await fs.readFile(join(created.dir, 'package.json'), 'utf8'))).toMatchObject({
+      dependencies: { 'dsh-searxng': '0.5.0' },
+      dsh: { profile: { bundles: [] } },
+    })
+    expect(ids(await fs.readFile(created.patchPath, 'utf8'))).toEqual(['web-search-searxng'])
+  })
+
+  it('refuses to write a config row the bundle layer would not mount', async () => {
+    const original = '[]\n'
+    const { manager, dir, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: ['dsh-searxng'] } } },
+      patch: original,
+      bundle: 'other-id',
+    })
+    let validations = 0
+
+    const error = await manager.attach('web', 'http://127.0.0.1:8080', async () => {
+      validations += 1
+    }).catch((cause: unknown) => cause)
+
+    expect(error).toMatchObject({
+      code: 'E_PROFILE_BUNDLE_MISSING',
+      details: { bundleMount: 'target-not-inserted', plugin: 'dsh-searxng' },
+    })
+    // The operator gets the exact consequence, not a generic write failure.
+    expect((error as Error).message).toContain('WEB_PROVIDER_CONFIGURED_MISSING')
+    expect((error as Error).message).toContain('silently skipped')
+    // Nothing was written and no validation ran against a broken profile.
+    expect(validations).toBe(0)
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(original)
+    // The plugin is still installed: only the unmountable row was refused.
+    expect(JSON.parse(await fs.readFile(join(dir, 'package.json'), 'utf8')))
+      .toMatchObject({ dependencies: { 'dsh-searxng': '0.5.0' } })
+  })
+
+  it('reports a bundle patch that cannot be read as a distinct reason', async () => {
+    const { manager } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: ['dsh-searxng'] } } },
+      bundle: 'unreadable',
+    })
+    await expect(manager.preview('web', 'http://127.0.0.1:8080')).resolves.toMatchObject({
+      mount: { enrolled: true, composes: false, reason: 'patch-unreadable', observable: true },
+    })
+  })
+
+  it('reports a plugin without bundle metadata as a distinct reason', async () => {
+    const { manager } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: ['dsh-searxng'] } } },
+      bundle: 'no-metadata',
+    })
+    await expect(manager.preview('web', 'http://127.0.0.1:8080')).resolves.toMatchObject({
+      mount: { enrolled: true, composes: false, reason: 'no-bundle-metadata', observable: true },
+    })
+  })
+
+  it('reports an enrolled bundle whose package is absent as undecidable, not broken', async () => {
+    const { manager } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: ['dsh-searxng'] } } },
+      bundle: null,
+    })
+    // `preview` still reports it so `doctor` can act, but marks it undecidable
+    // so the write guard does not misattribute an install failure.
+    await expect(manager.preview('web', 'http://127.0.0.1:8080')).resolves.toMatchObject({
+      mount: { enrolled: true, composes: false, reason: 'package-missing', observable: false },
+    })
+  })
+
+  it('does not misattribute an absent package to a bundle-composition bug', async () => {
+    const { manager } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: ['dsh-searxng'] } } },
+      patch: '[]\n',
+      bundle: null,
+    })
+    // The package is enrolled but not installed, so there is no patch file to
+    // read. `attach` must not refuse on the strength of an unobservable layer.
+    await expect(manager.attach('web', 'http://127.0.0.1:8080', async () => {}))
+      .resolves.toBeUndefined()
+  })
+
+  it('is idempotent: a second attach reports no further enrollment', async () => {
+    const { manager, dir } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' }, dsh: { profile: { bundles: [] } } },
+      patch: '[]\n',
+    })
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+    const manifestPath = join(dir, 'package.json')
+    const afterFirst = await fs.readFile(manifestPath, 'utf8')
+    const before = await fs.lstat(manifestPath)
+
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+
+    // An already-enrolled bundle is left byte-identical and untouched on disk.
+    await expect(fs.readFile(manifestPath, 'utf8')).resolves.toBe(afterFirst)
+    expect((await fs.lstat(manifestPath)).ino).toBe(before.ino)
+    const bundles = (JSON.parse(afterFirst) as { dsh: { profile: { bundles: string[] } } }).dsh.profile.bundles
+    expect(bundles.filter((name) => name === 'dsh-searxng')).toHaveLength(1)
+  })
+
+  it('creates the bundle list when the manifest has no dsh section', async () => {
+    const { manager, dir } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' } },
+      patch: '[]\n',
+      // A manifest with no `dsh.profile` at all: enrollment must create it.
+    })
+    // Remove the enrollment the fixture adds for object manifests, so this
+    // exercises the no-`dsh` branch specifically.
+    const manifestPath = join(dir, 'package.json')
+    await fs.writeFile(manifestPath, `${JSON.stringify({ dependencies: { 'dsh-searxng': '0.5.0' } }, null, 2)}\n`)
+
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as {
+      dependencies: Record<string, string>
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(manifest.dsh.profile.bundles).toEqual(['dsh-searxng'])
+    expect(manifest.dependencies).toEqual({ 'dsh-searxng': '0.5.0' })
+  })
+
+  it('preserves unrelated manifest fields and key order on enrollment', async () => {
+    const { manager, dir } = await fixture({
+      packageJson: {
+        name: 'dsh-profile-web',
+        private: true,
+        dependencies: { 'dsh-searxng': '0.5.0' },
+        dsh: { profile: { bundles: [], extra: 'kept' }, unrelated: 42 },
+        other: { nested: true },
+      },
+      patch: '[]\n',
+    })
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+
+    const text = await fs.readFile(join(dir, 'package.json'), 'utf8')
+    expect(text.endsWith('\n')).toBe(true)
+    const manifest = JSON.parse(text) as Record<string, unknown>
+    expect(manifest).toMatchObject({
+      name: 'dsh-profile-web',
+      private: true,
+      dependencies: { 'dsh-searxng': '0.5.0' },
+      dsh: { profile: { bundles: ['dsh-searxng'], extra: 'kept' }, unrelated: 42 },
+      other: { nested: true },
+    })
+  })
+})
+
 describe('ProfileManager explicit uninstall', () => {
   it('uses the standard DSH command and verifies removal from the manifest', async () => {
     const test = await fixture({ packageJson: { dependencies: { 'dsh-searxng': '0.1.1', other: '1.0.0' } } })
@@ -328,6 +662,25 @@ describe('ProfileManager explicit uninstall', () => {
     const test = await fixture({ packageJson: { dependencies: { other: '1.0.0' } } })
     await test.manager.uninstall('web')
     expect(test.runner.calls).toEqual([])
+  })
+
+  it('invokes the executable named by DSH_SEARXNG_DSH_BIN when no command is injected', async () => {
+    // A Desktop-only install has no `dsh` on PATH; the override is the
+    // supported way to point the CLI at the executable that does exist.
+    const bin = process.platform === 'win32' ? 'C:\\opt\\dsh\\dsh.cmd' : '/opt/dsh/dsh'
+    const previous = process.env.DSH_SEARXNG_DSH_BIN
+    process.env.DSH_SEARXNG_DSH_BIN = bin
+    try {
+      const { manager, runner } = await fixture({ packageJson: { dependencies: { 'dsh-searxng': '0.5.0' } } })
+      await manager.uninstall('web')
+      expect(runner.calls).toContainEqual({
+        command: bin,
+        args: ['plugin', '--profile', 'web', 'remove', 'dsh-searxng'],
+      })
+    } finally {
+      if (previous === undefined) delete process.env.DSH_SEARXNG_DSH_BIN
+      else process.env.DSH_SEARXNG_DSH_BIN = previous
+    }
   })
 })
 
@@ -377,9 +730,88 @@ describe('transactional attachment', () => {
     })
     expect(validations).toBe(0)
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(original)
+  })
+
+  it('passes the pinned install spec, not the bare registry name', async () => {
+    // The bare name is the self-install blocker: the registry would serve
+    // whatever `latest` is, which can be an older, correctly-rejected version.
+    const { manager, runner } = await fixture({
+      packageJson: { dependencies: {} },
+      patch: '[]\n',
+      pluginSpec: 'dsh-searxng@9.9.9',
+    })
+    await manager.attach('web', 'http://localhost:8080', async () => {})
+    expect(runner.calls.map((call) => call.args)).toContainEqual([
+      'plugin', '--profile', 'web', 'add', 'dsh-searxng@9.9.9',
+    ])
+    expect(runner.calls.map((call) => call.args).flat()).not.toContain(PLUGIN_NAME)
+  })
+
+  it('uses an injected local tarball spec verbatim so a pre-publication install works', async () => {
+    // The exact case that was broken: 0.5.0 exists in a tarball but not on npm.
+    const spec = 'file:./pack/dsh-searxng-0.5.0.tgz'
+    const { manager, runner } = await fixture({
+      packageJson: { dependencies: {} },
+      patch: '[]\n',
+      pluginSpec: spec,
+    })
+    await manager.attach('web', 'http://localhost:8080', async () => {})
+    expect(runner.calls.map((call) => call.args)).toContainEqual([
+      'plugin', '--profile', 'web', 'add', spec,
+    ])
+  })
+
+  it('reports an incompatible-package rejection precisely instead of a generic install failure', async () => {
+    // Reproduces the plugin manager's real diagnostic for an older release.
+    const runner = new RecordingRunner()
+    runner.simulatePluginEffects = false
+    runner.handler = async () => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: [
+        'dsh: installation rejected: Plugin dsh-searxng@0.4.0 is incompatible with dsh 0.2.1-rc.2:',
+        'requirements {"@deepseek-ai/dsh-web":">=0.1.0-rc.6 <0.2.0"}. Exact-version exemption: not active.',
+        'dsh: nothing was installed.',
+      ].join('\n'),
+    })
+    const original = '[]\n'
+    const { manager, patchPath } = await fixture({ patch: original, runner })
+
+    const error = await manager.attach('web', 'http://localhost:8080', async () => {})
+      .catch((cause: unknown) => cause)
+
+    // A precise, actionable code — not E_PROFILE_WRITE/profile-conflict, which
+    // told the operator nothing about the actual problem.
+    expect(error).toMatchObject({ code: 'E_PLUGIN_INSTALL_FAILED', details: { incompatible: true } })
+    const cliError = error as CliError
+    // The manager's own lines are quoted: they name the failing requirement.
+    expect(cliError.message).toContain('incompatible with this dsh runtime')
+    expect(cliError.message).toContain('dsh-searxng@0.4.0')
+    expect(cliError.message).toContain('>=0.1.0-rc.6 <0.2.0')
+    // The remedy names the override, since that is the way out pre-publication.
+    expect(cliError.action).toContain(PLUGIN_SPEC_ENV)
+    // Nothing was written: a refused install must not leave a config row behind.
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(original)
+  })
+
+  it('keeps every other add failure a plain install failure', async () => {
+    // Only an incompatibility is separately actionable; a registry/network error
+    // must not be misreported as an incompatibility.
+    const runner = new RecordingRunner()
+    runner.simulatePluginEffects = false
+    runner.handler = async () => ({
+      exitCode: 1,
+      stdout: '',
+      stderr: 'ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/dsh-searxng: Not Found',
+    })
+    const { manager } = await fixture({ patch: '[]\n', runner })
+    await expect(manager.attach('web', 'http://localhost:8080', async () => {})).rejects.toMatchObject({
+      code: 'E_PROFILE_WRITE',
+      details: { primaryFailure: 'install', primaryError: 'process' },
+    })
   })
 
   it('does not claim or remove a plugin when the post-add manifest ownership snapshot is unstable', async () => {
@@ -418,7 +850,7 @@ describe('transactional attachment', () => {
       },
     })
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(manifestPath, 'utf8')).resolves.toBe(installed)
   })
@@ -511,6 +943,7 @@ describe('transactional attachment', () => {
       engines: 'bing',
       categories: 'general',
       authHeader: 'Bearer private-token',
+      mode: 'external',
     })
     const rows = parse(await fs.readFile(patchPath, 'utf8')) as Array<{ config?: Record<string, unknown> }>
     expect(rows.at(-1)?.config?.baseURL).toBe('https://search.example')
@@ -532,7 +965,7 @@ describe('transactional attachment', () => {
 
     expect(recorded.calls).toEqual([{
       command: 'dsh',
-      args: ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      args: ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     }])
     expect(events).toEqual(['install', 'validate'])
     const output = await fs.readFile(patchPath, 'utf8')
@@ -579,6 +1012,7 @@ describe('transactional attachment', () => {
         baseURL: 'https://search.example/root',
         unknownKey: 'keep',
         nested: { enabled: true },
+        mode: 'external',
       },
     })
   })
@@ -606,6 +1040,7 @@ describe('transactional attachment', () => {
     expect((parse(output) as Array<{ config: Record<string, unknown> }>).at(-1)?.config).toEqual({
       timeoutMs: 5000,
       baseURL: 'http://newer.example',
+      mode: 'external',
     })
   })
 
@@ -638,6 +1073,7 @@ describe('transactional attachment', () => {
       source: 'managed',
       laterOnly: 'keep',
       baseURL: 'http://new.example',
+      mode: 'external',
     })
   })
 
@@ -668,6 +1104,7 @@ describe('transactional attachment', () => {
       source: 'later-user',
       userOnly: 'keep',
       baseURL: 'http://new.example',
+      mode: 'external',
     })
   })
 
@@ -714,7 +1151,7 @@ describe('transactional attachment', () => {
     })
 
     expect(runner.calls).toEqual([
-      { command: 'dsh', args: ['plugin', '--profile', 'web', 'add', 'dsh-searxng'] },
+      { command: 'dsh', args: ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC] },
     ])
     await expect(fs.readFile(patchPath)).resolves.toEqual(original)
     await expect(manager.inspect('web')).resolves.toMatchObject({ installed: true })
@@ -731,7 +1168,7 @@ describe('transactional attachment', () => {
     await expect(manager.attach('web', 'http://localhost:8080', async () => {})).resolves.toBeUndefined()
 
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toContain('dsh-searxng managed attachment')
   })
@@ -762,7 +1199,7 @@ describe('transactional attachment', () => {
     })
 
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(manifestPath, 'utf8')).resolves.toBe(`${JSON.stringify(concurrentManifest, null, 2)}\n`)
     await expect(fs.readFile(created.patchPath, 'utf8')).resolves.toBe('[]\n')
@@ -808,7 +1245,7 @@ describe('transactional attachment', () => {
       details: { rollbackFailures: ['plugin-residual'] },
     })
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.lstat(patchPath)).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(manager.inspect('web')).resolves.toMatchObject({ installed: true })
@@ -846,7 +1283,7 @@ describe('transactional attachment', () => {
     })
 
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(patchPath)).resolves.toEqual(initialized)
   })
@@ -875,20 +1312,28 @@ describe('rollback and file safety', () => {
   }
 
   it('does not validate, cleans temporary files, restores bytes, and retains an added plugin after write failure', async () => {
-    let failNextTempWrite = true
+    // Inject the failure on the PATCH write specifically, not by call ordinal:
+    // attach now also writes the profile manifest when it has to enrol the
+    // bundle, so "the first temp file opened" is no longer necessarily the
+    // patch. Targeting the path keeps this test about patch-write rollback.
+    let failed = false
+    let patchPathForInjection = ''
     const fileSystem: ProfileFileSystem = {
       ...fs,
       open: async (...args: Parameters<typeof fs.open>) => {
         const handle = await fs.open(...args)
-        if (String(args[0]).includes('.tmp-') && failNextTempWrite) {
-          failNextTempWrite = false
+        const target = String(args[0])
+        if (!failed && target.includes(patchPathForInjection) && target.includes('.tmp-')) {
+          failed = true
           return proxiedHandle(handle, async () => { throw new Error('write secret') })
         }
         return handle
       },
     }
     const original = Buffer.from('# exact\n[]\n')
-    const { manager, runner, dir, patchPath } = await fixture({ patch: original.toString(), fileSystem })
+    const created = await fixture({ patch: original.toString(), fileSystem })
+    patchPathForInjection = created.patchPath
+    const { manager, runner, dir, patchPath } = created
     let validations = 0
     await expect(manager.attach('web', 'http://localhost:8080', async () => { validations += 1 }))
       .rejects.toMatchObject({
@@ -897,7 +1342,7 @@ describe('rollback and file safety', () => {
       })
     expect(validations).toBe(0)
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(manager.inspect('web')).resolves.toMatchObject({ installed: true })
     await expect(fs.readFile(patchPath)).resolves.toEqual(original)
@@ -905,16 +1350,26 @@ describe('rollback and file safety', () => {
   })
 
   it('reports patch rollback failure alongside the primary failure without leaking causes', async () => {
-    let renames = 0
+    // Target the rollback rename of the patch file by path rather than "the
+    // second rename": attach performs an additional manifest rename when it
+    // enrols the bundle, so ordinals are not stable.
+    let patchPathForInjection = ''
+    let patchRenames = 0
     const fileSystem: ProfileFileSystem = {
       ...fs,
       rename: async (...args: Parameters<typeof fs.rename>) => {
-        renames += 1
-        if (renames === 2) throw new Error('rollback endpoint https://private.invalid?q=token')
+        if (String(args[1]) === patchPathForInjection) patchRenames += 1
+        // The first patch rename is the forward write; the second is the
+        // rollback, which is the one that must fail here.
+        if (String(args[1]) === patchPathForInjection && patchRenames === 2) {
+          throw new Error('rollback endpoint https://private.invalid?q=token')
+        }
         await fs.rename(...args)
       },
     }
-    const { manager } = await fixture({ patch: '[]\n', fileSystem })
+    const created = await fixture({ patch: '[]\n', fileSystem })
+    patchPathForInjection = created.patchPath
+    const { manager } = created
     let error: unknown
     try {
       await manager.attach('web', 'http://localhost:8080', async () => { throw new Error('validation token') })
@@ -969,7 +1424,7 @@ describe('rollback and file safety', () => {
       details: { primaryError: 'abort', rollbackFailures: ['plugin-residual'] },
     })
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     expect(runner.signals[0]).toBe(controller.signal)
   })
@@ -996,7 +1451,7 @@ describe('rollback and file safety', () => {
       },
     })
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(manager.inspect('web')).resolves.toMatchObject({ installed: true })
   })
@@ -1022,7 +1477,7 @@ describe('rollback and file safety', () => {
       },
     })
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(changed)
   })
@@ -1049,7 +1504,7 @@ describe('rollback and file safety', () => {
       },
     })
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(changed)
   })
@@ -1091,7 +1546,7 @@ describe('rollback and file safety', () => {
     })
     expect(validations).toBe(0)
     expect(runner.calls.map((call) => call.args)).toEqual([
-      ['plugin', '--profile', 'web', 'add', 'dsh-searxng'],
+      ['plugin', '--profile', 'web', 'add', TEST_PLUGIN_SPEC],
     ])
     await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(changed)
   })
@@ -1312,7 +1767,9 @@ describe('rollback and file safety', () => {
     expect((await fs.readdir(dir)).filter((name) => name.includes('.tmp-'))).toEqual([])
   })
 
-  it('rejects symlinked profile files without following or changing them', async () => {
+  // Gated on a MEASURED capability, not `process.platform`: a Windows host with
+  // Developer Mode keeps this coverage. See symlink-capability.ts.
+  it.skipIf(symlinkUnsupported)(symlinkTestTitle('rejects symlinked profile files without following or changing them'), async () => {
     const outside = await fs.mkdtemp(join(tmpdir(), 'dsh-profile-outside-'))
     roots.push(outside)
     const secret = join(outside, 'secret.yml')
@@ -1444,6 +1901,72 @@ describe('YAML document shape', () => {
     await manager.attach('web', 'http://second.example', async () => {})
     await manager.detach('web')
     expect(parse(await fs.readFile(patchPath, 'utf8'))).toEqual([])
+  })
+
+  it('writes block style, matching the shape a DSH profile and the shipped template use', async () => {
+    // A profile initialized from the shipped template starts as the flow
+    // sequence `[]`. Appending to it would otherwise serialize the whole file as
+    // `[{ id: ..., config: { ... } }]`: valid YAML, but nothing like the block
+    // shape every real profile has, and unreadable as the config grows.
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' } },
+      patch: '# keep me\n[]\n',
+    })
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+
+    const output = await fs.readFile(patchPath, 'utf8')
+    expect(output).toContain('# keep me')
+    // Block sequence and block mapping, with the comment preserved above.
+    expect(output).toBe([
+      '# keep me',
+      '# dsh-searxng managed attachment',
+      '- id: web-search-searxng',
+      '  config:',
+      '    baseURL: http://127.0.0.1:8080',
+      '    mode: external',
+      '',
+    ].join('\n'))
+    expect(parseDocument(output).errors).toEqual([])
+  })
+
+  it('writes mode and baseURL in the same order and shape regardless of attach count', async () => {
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' } },
+      patch: '[]\n',
+    })
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+    const first = await fs.readFile(patchPath, 'utf8')
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {})
+    // Idempotent: a repeat attach with the same endpoint writes identical bytes.
+    await expect(fs.readFile(patchPath, 'utf8')).resolves.toBe(first)
+  })
+
+  it('preserves a baseURLs failover pool verbatim while writing mode and baseURL', async () => {
+    // The pool is the operator's own configuration and outranks `baseURL` inside
+    // the provider. The CLI records the requested endpoint and the mode but must
+    // never reorder, dedupe, or drop the pool — reordering could push traffic to
+    // an endpoint they did not choose as primary.
+    const patch = `- id: web-search-searxng
+  config:
+    baseURL: http://old.invalid
+    baseURLs:
+      - https://primary.example
+      - https://secondary.example
+    language: zh-CN
+`
+    const { manager, patchPath } = await fixture({
+      packageJson: { dependencies: { 'dsh-searxng': '0.5.0' } },
+      patch,
+    })
+    await manager.attach('web', 'http://127.0.0.1:8080', async () => {}, undefined, 'external')
+
+    const rows = parse(await fs.readFile(patchPath, 'utf8')) as Array<{ id: string; config?: Record<string, unknown> }>
+    expect(rows.at(-1)?.config).toEqual({
+      baseURL: 'http://127.0.0.1:8080',
+      baseURLs: ['https://primary.example', 'https://secondary.example'],
+      language: 'zh-CN',
+      mode: 'external',
+    })
   })
 
   it('rejects removing a managed anchor referenced by a later retained alias', async () => {

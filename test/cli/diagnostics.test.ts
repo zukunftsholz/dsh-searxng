@@ -74,7 +74,7 @@ describe('diagnose', () => {
     const result = await diagnose('web', 'doctor', test.dependencies)
     expect(result.healthy).toBe(true)
     expect(result.checks.map((check) => check.id)).toEqual([
-      'environment', 'docker', 'ownership', 'container', 'http', 'json', 'search', 'profile', 'provider',
+      'environment', 'mode', 'docker', 'ownership', 'container', 'http', 'json', 'search', 'profile', 'bundle', 'provider',
     ])
     expect(result.checks.every((check) => check.status === 'pass')).toBe(true)
     expect(test.calls).toEqual(['environment', 'dsh', 'profile', 'docker', 'ownership', 'http', 'json', 'search', 'provider'])
@@ -83,10 +83,48 @@ describe('diagnose', () => {
   it('skips every Docker check for external profiles', async () => {
     const test = harness('external')
     const result = await diagnose('web', 'doctor', test.dependencies)
-    expect(result.checks.slice(1, 4).map((check) => check.status)).toEqual(['skip', 'skip', 'skip'])
+    // `environment`, `mode`, then the three Docker checks, which are skipped
+    // rather than failed: an external deployment has no Docker to check.
+    expect(result.checks.slice(2, 5).map((check) => check.status)).toEqual(['skip', 'skip', 'skip'])
     expect(test.dependencies.docker.preflight).not.toHaveBeenCalled()
     expect(test.dependencies.docker.deploymentStatus).not.toHaveBeenCalled()
     expect(result.healthy).toBe(true)
+  })
+
+  it('reports the deployment mode in force before anything that depends on it', async () => {
+    const managed = await diagnose('web', 'doctor', harness().dependencies)
+    expect(managed.checks.find((check) => check.id === 'mode')).toEqual({
+      id: 'mode',
+      status: 'pass',
+      message: expect.stringMatching(/managed/i),
+    })
+
+    const external = await diagnose('web', 'doctor', harness('external').dependencies)
+    const mode = external.checks.find((check) => check.id === 'mode')
+    expect(mode).toMatchObject({ status: 'pass', message: expect.stringMatching(/external/i) })
+    // The external message must state the Docker consequence, not just a label.
+    expect(mode?.message).toMatch(/Docker is not used/i)
+  })
+
+  it('comes out healthy in external mode with no Docker available at all', async () => {
+    // The acceptance criterion behind the user's directive: an operator using an
+    // existing SearXNG on a machine with no Docker must not be told anything is
+    // wrong. Every Docker entry point throws if touched.
+    const test = harness('external')
+    const dockerAbsent = new CliError('E_DOCKER_MISSING', 'no docker', 'install docker')
+    test.dependencies.docker.preflight = vi.fn(async () => { throw dockerAbsent })
+    test.dependencies.docker.inspectOwnership = vi.fn(async () => { throw dockerAbsent })
+    test.dependencies.docker.deploymentStatus = vi.fn(async () => { throw dockerAbsent })
+
+    const result = await diagnose('web', 'doctor', test.dependencies)
+
+    expect(result.healthy).toBe(true)
+    expect(result.checks.some((check) => check.status === 'fail')).toBe(false)
+    expect(test.dependencies.docker.preflight).not.toHaveBeenCalled()
+    expect(test.dependencies.docker.inspectOwnership).not.toHaveBeenCalled()
+    expect(test.dependencies.docker.deploymentStatus).not.toHaveBeenCalled()
+    // E_DOCKER_* is unreachable in external mode, so it cannot appear at all.
+    expect(JSON.stringify(result)).not.toMatch(/E_DOCKER_|E_COMPOSE_UNSUPPORTED/)
   })
 
   it('records the first failure and skips unsafe downstream doctor checks with redacted errors', async () => {
@@ -94,7 +132,7 @@ describe('diagnose', () => {
     const result = await diagnose('web', 'doctor', test.dependencies)
     const json = result.checks.find((check) => check.id === 'json')
     expect(json).toMatchObject({ status: 'fail', error: { code: 'E_SEARCH_FAILED', authHeader: '[REDACTED]' } })
-    expect(result.checks.slice(6).map((check) => check.status)).toEqual(['skip', 'skip', 'skip'])
+    expect(result.checks.slice(7).map((check) => check.status)).toEqual(['skip', 'skip', 'skip', 'skip'])
     expect(result.healthy).toBe(false)
   })
 
@@ -102,7 +140,7 @@ describe('diagnose', () => {
     const test = harness('managed', 'docker')
     const result = await diagnose('web', 'status', test.dependencies)
     expect(result.checks.map((check) => [check.id, check.status])).toEqual([
-      ['environment', 'pass'], ['docker', 'fail'],
+      ['environment', 'pass'], ['mode', 'pass'], ['docker', 'fail'],
     ])
     expect(test.dependencies.docker.deploymentStatus).not.toHaveBeenCalled()
   })

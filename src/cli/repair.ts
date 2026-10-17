@@ -503,11 +503,15 @@ async function executeAction(
       return undefined
     }
     case 'reattach-profile': {
+      // The mode comes from the recorded attachment, not a default: repair must
+      // restore the shape the profile had, or a later `remove --service` and the
+      // settings page would disagree about whether Docker is involved.
       await dependencies.profiles.attach(
         action.profile,
         action.endpoint,
         async (config) => { await dependencies.searxng.providerSearch(config, signal) },
         signal,
+        state.profiles[action.profile]?.mode ?? 'external',
       )
       return undefined
     }

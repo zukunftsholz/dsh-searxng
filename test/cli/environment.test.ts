@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { join, normalize, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import {
+  DSH_BIN_ENV,
+  DSH_MISSING_ACTION,
   NodeEnvironmentService,
+  resolveDshCommand,
   homeId,
   managedDir,
   profileDir,
@@ -28,10 +31,24 @@ describe('environment helpers', () => {
 
   it('derives profile and managed paths and rejects unsafe profiles', () => {
     expect(profileDir('/tmp/.dsh', 'web')).toBe(join('/tmp/.dsh', 'profiles', 'web'))
-    expect(profileDir('/tmp/.dsh', 'node_modules')).toBe(join('/tmp/.dsh', 'profiles', 'node_modules'))
     expect(managedDir('/tmp/.dsh')).toBe(join('/tmp/.dsh', 'dsh-searxng'))
     for (const profile of ['', '.', '..', 'a/b', 'a\\b']) {
       try { profileDir('/tmp/.dsh', profile); throw new Error('expected rejection') } catch (error) { expect(error).toMatchObject({ code: 'E_PROFILE_INVALID' }) }
+    }
+  })
+
+  it('rejects exactly the profile names the DSH launcher rejects', () => {
+    // Quoted from `resolveProfileDir` in @deepseek-ai/dsh-app-boot 0.2.1-rc.2:
+    // a name this CLI accepts but dsh refuses would produce a profile directory
+    // the harness can never boot.
+    for (const profile of ['node_modules']) {
+      expect(() => profileDir('/tmp/.dsh', profile)).toThrow(
+        expect.objectContaining({ code: 'E_PROFILE_INVALID' }),
+      )
+    }
+    // Every name dsh accepts still resolves.
+    for (const profile of ['web', 'desktop', 'work-2', 'a_b', 'UPPER']) {
+      expect(profileDir('/tmp/.dsh', profile)).toBe(join('/tmp/.dsh', 'profiles', profile))
     }
   })
 
@@ -74,7 +91,7 @@ describe('environment helpers', () => {
   })
 
   it.each([{ exitCode: 127 }, { exitCode: 1 }])('reports missing or nonzero dsh with stable error', async (result) => {
-    await expect(new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run: async () => ({ ...result, stdout: '', stderr: '' }) } }).preflightDsh()).rejects.toMatchObject({ code: 'E_DSH_MISSING', action: 'Install dsh and ensure it is on PATH' })
+    await expect(new NodeEnvironmentService({ portChecker: async () => true, commandRunner: { run: async () => ({ ...result, stdout: '', stderr: '' }) } }).preflightDsh()).rejects.toMatchObject({ code: 'E_DSH_MISSING', action: DSH_MISSING_ACTION })
   })
 
   it('maps a thrown ENOENT from dsh --version to the stable missing-dsh error', async () => {
@@ -86,8 +103,48 @@ describe('environment helpers', () => {
 
     await expect(service.preflightDsh()).rejects.toMatchObject({
       code: 'E_DSH_MISSING',
-      action: 'Install dsh and ensure it is on PATH',
+      action: DSH_MISSING_ACTION,
     })
+  })
+
+  it('names the Desktop-only installation case and the override in the missing-dsh guidance', () => {
+    // The Desktop install ships its CLI inside resources/app.asar and puts no
+    // `dsh` on PATH, so bare "install dsh" is not actionable advice there.
+    expect(DSH_MISSING_ACTION).toContain('npm install -g @deepseek-ai/dsh@next')
+    expect(DSH_MISSING_ACTION).toContain('resources/app.asar')
+    // The override is the supported answer for a Desktop-only machine.
+    expect(DSH_MISSING_ACTION).toContain(DSH_BIN_ENV)
+  })
+
+  it('prefers the @next tag because latest is an unsupported older line', () => {
+    // `@deepseek-ai/dsh` publishes `latest` at 0.2.0-rc.2 and the 0.2.1 line
+    // under `next`; a bare install would land the operator on a harness this
+    // plugin does not support.
+    expect(DSH_MISSING_ACTION).not.toMatch(/npm install -g @deepseek-ai\/dsh\)/)
+    expect(DSH_MISSING_ACTION).toMatch(/@deepseek-ai\/dsh@next/)
+  })
+
+  it('resolves the dsh executable from DSH_SEARXNG_DSH_BIN when set', () => {
+    expect(resolveDshCommand({ [DSH_BIN_ENV]: '/opt/dsh/bin/dsh.cmd' })).toBe('/opt/dsh/bin/dsh.cmd')
+    // Whitespace padding is trimmed, matching how the CLI reads DSH_HOME.
+    expect(resolveDshCommand({ [DSH_BIN_ENV]: '  /opt/dsh  ' })).toBe('/opt/dsh')
+  })
+
+  it('falls back to PATH lookup when the override is absent or blank', () => {
+    expect(resolveDshCommand({})).toBe('dsh')
+    expect(resolveDshCommand({ [DSH_BIN_ENV]: '' })).toBe('dsh')
+    expect(resolveDshCommand({ [DSH_BIN_ENV]: '   ' })).toBe('dsh')
+  })
+
+  it('invokes the configured executable rather than a hardcoded dsh', async () => {
+    const run = vi.fn(async () => ({ exitCode: 0, stdout: '', stderr: '' }))
+    const service = new NodeEnvironmentService({
+      env: { [DSH_BIN_ENV]: '/opt/dsh/bin/dsh.cmd' },
+      portChecker: async () => true,
+      commandRunner: { run },
+    })
+    await service.preflightDsh()
+    expect(run).toHaveBeenCalledWith('/opt/dsh/bin/dsh.cmd', ['--version'], { signal: undefined })
   })
 
   it('maps a port-checker failure to an actionable stable conflict error without invoking dsh', async () => {

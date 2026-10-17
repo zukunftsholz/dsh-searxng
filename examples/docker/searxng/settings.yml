@@ -1,5 +1,9 @@
-# Development-only settings. Compose replaces this placeholder from
-# SEARXNG_SECRET; the packaged setup generates and stores a private secret.
+# Development-only settings for the external example instance. `SEARXNG_SECRET`
+# from docker-compose.yml supplies the real secret; this value is only the
+# fallback SearXNG ships with, so never reuse it on a non-loopback instance.
+# The packaged managed setup renders its own settings from
+# assets/docker/settings.yml.template with a generated secret and never uses
+# this file.
 use_default_settings: true
 
 server:

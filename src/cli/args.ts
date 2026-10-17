@@ -1,10 +1,17 @@
 import { parseArgs } from 'node:util'
+import type { SearxngMode } from '../index.ts'
 
 export type CliCommand =
   | { command: 'help' }
   | {
       command: 'setup'
       profile: string
+      /**
+       * Which deployment shape the operator asked for. Required: `setup` never
+       * guesses, because guessing wrong either provisions a container nobody
+       * wanted or silently targets an endpoint that does not exist.
+       */
+      mode: SearxngMode
       url?: string
       port: number
       portExplicit: boolean
@@ -44,16 +51,47 @@ const options = {
   'purge-data': { type: 'boolean' as const },
   yes: { type: 'boolean' as const },
   'deployment-version': { type: 'string' as const },
+  managed: { type: 'boolean' as const },
   help: { type: 'boolean' as const, short: 'h' },
 }
 
-function invalid(message: string): never {
-  throw new Error(`Invalid CLI arguments: ${message}`)
+/**
+ * The argument error carries its own code so the CLI entry point can report the
+ * same precise failure the setup use case reports. A generic usage error would
+ * hide the one thing the operator must decide: which deployment shape to use.
+ */
+export class ArgumentError extends Error {
+  readonly code: 'E_USAGE' | 'E_MODE_REQUIRED' | 'E_MODE_MISMATCH'
+
+  constructor(message: string, code: ArgumentError['code'] = 'E_USAGE') {
+    super(`Invalid CLI arguments: ${message}`)
+    this.name = 'ArgumentError'
+    this.code = code
+  }
 }
 
+function invalid(message: string): never {
+  throw new ArgumentError(message)
+}
+
+function invalidMode(message: string, code: 'E_MODE_REQUIRED' | 'E_MODE_MISMATCH'): never {
+  throw new ArgumentError(message, code)
+}
+
+/**
+ * Validate a profile name against the DSH launcher's own rule. Kept in sync
+ * with `assertValidProfile` (and with `resolveProfileDir` in
+ * `@deepseek-ai/dsh-app-boot` 0.2.1-rc.2): a name dsh refuses must fail here,
+ * before this CLI creates a directory the harness cannot boot.
+ * @param value - the `--profile` value, or undefined for the default.
+ * @returns the profile name.
+ */
 function parseProfile(value: string | undefined): string {
   const profile = value ?? 'web'
-  if (!profile || profile === '.' || profile === '..' || profile.includes('/') || profile.includes('\\')) {
+  if (
+    !profile || profile === '.' || profile === '..' || profile === 'node_modules' ||
+    profile.includes('/') || profile.includes('\\')
+  ) {
     invalid('profile must be a safe name')
   }
   return profile
@@ -128,13 +166,32 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   const deploymentVersion = parseDeploymentVersion(parsed.values['deployment-version'])
 
   if (cliCommand !== 'setup' && url !== undefined) invalid('--url is only supported by setup')
+  if (cliCommand !== 'setup' && parsed.values.managed !== undefined) invalid('--managed is only supported by setup')
   if (cliCommand !== 'remove' && (service || purgeData || yes)) invalid('remove flags are only supported by remove')
   if (cliCommand === 'remove' && purgeData && !service) invalid('--purge-data requires --service')
   if (cliCommand === 'remove' && yes && !purgeData) invalid('--yes requires --purge-data')
 
+  // `setup` has two mutually exclusive deployment shapes and no default: the
+  // managed one provisions a Docker container, which must never happen because
+  // the operator omitted a flag. `--url` selects an existing instance;
+  // `--managed` explicitly opts into provisioning.
+  if (cliCommand === 'setup') {
+    const managed = parsed.values.managed ?? false
+    if (managed && url !== undefined) {
+      invalidMode('--managed and --url select different modes; pass only one', 'E_MODE_MISMATCH')
+    }
+    if (!managed && url === undefined) {
+      invalidMode(
+        'setup requires either --url <endpoint> (use an existing SearXNG) or --managed (provision one with Docker); it never deploys SearXNG by itself unless asked',
+        'E_MODE_REQUIRED',
+      )
+    }
+  }
+
   if (cliCommand === 'setup') return {
     command: cliCommand,
     profile,
+    mode: parsed.values.managed === true ? 'managed' : 'external',
     ...(url === undefined ? {} : { url }),
     port,
     portExplicit: parsed.values.port !== undefined,

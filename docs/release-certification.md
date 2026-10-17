@@ -6,6 +6,26 @@ tarball being published. This file is the evidence log: one row per required
 environment per release, filled in by the human who ran the certification on
 that host.
 
+## Current status
+
+**`0.5.0` is uncertified.** No report exists for it on any environment, and no `0.5.0` runner has
+been executed on real hardware. The runner's mechanics are verified against an in-process replica
+of its own harness (all nine checks, exit 0), but that is a test double, not a Docker host: it
+proves the runner's wiring, not that the managed journey works on macOS, Windows, or Linux.
+
+The records below cover `0.3.0` and `0.4.0`, which ran against the previous DeepSeek Harness line
+(`@deepseek-ai/dsh-web >=0.1.0-rc.6 <0.2.0`); `0.5.0` targets `0.2.1-rc.2` and carries the
+explicit-mode `setup`, the bundle-mount guard, and the pinned install spec. Those differences are
+not covered by an earlier run, so a certification for `0.4.0` does not carry forward — each release
+needs its own report from its own tarball, produced on the real platform.
+
+Certification is separate from the test suite. `pnpm verify` passes cleanly on every CI platform,
+Windows included: there are no known expected failures. The four symlink-refusal tests are skipped
+by a capability probe on hosts that cannot create symlinks (Windows needs Administrator rights or
+Developer Mode), and they run wherever the OS allows — including a Windows runner that has the
+privilege. A green CI run says the code is correct; it does not certify the managed Docker journey
+on any platform, which only a report below can do.
+
 ## Required environments
 
 | Environment | Runtime | Required for |
@@ -20,7 +40,8 @@ and must not be advertised as certified.
 
 ## Running the certification
 
-On each certification host (Node.js 20+, `dsh` on PATH, Docker running):
+On each certification host (Node.js 20+, a `dsh` CLI for DeepSeek Harness `0.2.1-rc.2`, Docker
+running):
 
 ```sh
 pnpm verify   # rebuilds lib/ first — pnpm pack alone would ship whatever lib/ currently holds
@@ -36,10 +57,26 @@ echo "exit: $?"
 the report.
 
 The runner refuses to start unless `dsh`, Docker, Compose v2, Node, and the
-tarball are present. It installs the tarball into a throwaway npm project with
-an isolated temporary `DSH_HOME`, never modifies the real package or any user
-home, prints progress to stderr, emits the JSON report to stdout only after
-cleanup, and exits 0 only when every check and the cleanup passed.
+tarball are present. Its preflight spawns `dsh --version` by name and never consults
+`DSH_SEARXNG_DSH_BIN`, so certify from a host with a real CLI on `PATH`; pointing that
+variable at a Desktop-only install satisfies the CLI's own checks but not the runner's
+preflight. The runner installs the tarball into a throwaway npm project with an isolated
+temporary `DSH_HOME`, never modifies the real package or any user home, prints progress to
+stderr, emits the JSON report to stdout only after cleanup, and exits 0 only when every check
+and the cleanup passed.
+
+The runner drives `setup --managed` in both the first and the repeated setup step, and asserts that
+each report records `mode: "managed"`. That pairing matters: `setup` has no default mode, so a
+runner that omitted the flag would fail the first check with `E_MODE_REQUIRED` and report every
+downstream check as `skip` — a report that reads like a broken plugin rather than an out-of-date
+runner — and a runner that passed the flag but let the profile record `external` would certify the
+wrong deployment shape. Both cases now fail loudly.
+
+The packed-tarball e2e journey's stub `dsh` mirrors the plugin manager's `reconcile()`: it writes
+`dependencies` **and** enrols the package in `dsh.profile.bundles`. A stub that wrote only
+`dependencies` would leave the profile unenrolled, so the journey would exercise a profile whose
+config row is never mounted — the same silent-non-mount class as the `E_PROFILE_BUNDLE_MISSING`
+state described in the README's *Bundle enrolment* section.
 
 Accept a report only when:
 
@@ -82,7 +119,42 @@ Two faults are injected deliberately, and `notes` documents them:
 Copy the block below once per release and fill every field. `Report path` is
 where the full JSON report is archived (for example, attached to the release).
 
-### v0.3.0
+### v0.5.0
+
+| Field | macOS + Docker Desktop | Windows + Docker Desktop + WSL2 | Linux + Docker Engine |
+|---|---|---|---|
+| Tarball SHA-256 | pending | pending | pending |
+| Package version | 0.5.0 | 0.5.0 | 0.5.0 |
+| Date (UTC) | pending | pending | pending |
+| Architecture | pending | pending | pending |
+| Docker / Compose | pending | pending | pending |
+| Report path | pending | pending | pending |
+| Result | pending | pending | pending |
+
+No `0.5.0` row may be filled from an earlier release's report. Until all three
+rows show `pass` from the same tarball hash, the README advertises `0.5.0` as
+uncertified.
+
+### v0.4.0 (historical)
+
+Produced against the previous harness line (`@deepseek-ai/dsh-web
+>=0.1.0-rc.6 <0.2.0`). Recorded here as history; it certifies the `0.4.0`
+tarball only and says nothing about `0.5.0`.
+
+| Field | macOS + Docker Desktop | Windows + Docker Desktop + WSL2 | Linux + Docker Engine |
+|---|---|---|---|
+| Tarball SHA-256 | `52cc36ae8f635aed89bd986543843475d98766eb4ae2fd676bd60c02e5a42cf5` | pending | pending |
+| Package version | 0.4.0 | pending | pending |
+| Date (UTC) | 2026-09-14 | pending | pending |
+| Architecture | darwin-arm64 | pending | pending |
+| Docker / Compose | 29.7.2 / 5.5.0 | pending | pending |
+| Report path | `docs/certification/v0.4.0-darwin-arm64.json` | pending | pending |
+| Result | pass (8/8 checks + cleanup) | pending | pending |
+
+### v0.3.0 (historical)
+
+Produced against the previous harness line. History only; superseded by the
+`0.4.0` report and unrelated to `0.5.0`.
 
 | Field | macOS + Docker Desktop | Windows + Docker Desktop + WSL2 | Linux + Docker Engine |
 |---|---|---|---|

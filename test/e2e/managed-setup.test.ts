@@ -62,8 +62,22 @@ const path = join(dir, 'package.json')
 let manifest = { dependencies: {} }
 try { manifest = JSON.parse(await readFile(path, 'utf8')) } catch {}
 manifest.dependencies ||= {}
-if (action === 'add') manifest.dependencies['dsh-searxng'] = '0.1.1'
-else delete manifest.dependencies['dsh-searxng']
+// Mirror plugin-manager's reconcile(): it keeps dsh.profile.bundles in step with
+// dependencies. A stub that wrote only dependencies would model the exact
+// silent-non-mount defect this port fixed (installed, but the bundle layer is
+// never applied), so the e2e journey would certify a profile that cannot mount.
+manifest.dsh ||= {}
+manifest.dsh.profile ||= {}
+const bundles = manifest.dsh.profile.bundles || []
+if (action === 'add') {
+  manifest.dependencies['dsh-searxng'] = '0.1.1'
+  if (!bundles.includes('dsh-searxng')) bundles.push('dsh-searxng')
+} else {
+  delete manifest.dependencies['dsh-searxng']
+}
+manifest.dsh.profile.bundles = action === 'add'
+  ? bundles
+  : bundles.filter((name) => name !== 'dsh-searxng')
 await writeFile(path, JSON.stringify(manifest) + '\\n')
 `, { mode: 0o755 })
     await chmod(fakeDsh, 0o755)
@@ -79,7 +93,7 @@ await writeFile(path, JSON.stringify(manifest) + '\\n')
       ], { cwd: root })
       cli = join(installDir, 'node_modules', '.bin', executableName)
 
-      await exec(cli, ['setup', '--profile', 'web', '--port', String(port)], { env: environment, timeout: 180_000 })
+      await exec(cli, ['setup', '--managed', '--profile', 'web', '--port', String(port)], { env: environment, timeout: 180_000 })
       const firstId = (await exec('docker', ['container', 'inspect', '--format', '{{.Id}}', project])).stdout.trim()
       const managedDir = join(dshHome, 'dsh-searxng')
       const firstBundles = (await readdir(managedDir)).filter((name) => name.startsWith('config-')).sort()
@@ -90,7 +104,7 @@ await writeFile(path, JSON.stringify(manifest) + '\\n')
       const query = await fetch(`http://127.0.0.1:${port}/search?q=e2e&format=json`).then((response) => response.json()) as { results?: unknown[] }
       expect(query.results?.length).toBeGreaterThan(0)
 
-      await exec(cli, ['setup', '--profile', 'web'], { env: environment, timeout: 180_000 })
+      await exec(cli, ['setup', '--managed', '--profile', 'web'], { env: environment, timeout: 180_000 })
       const secondId = (await exec('docker', ['container', 'inspect', '--format', '{{.Id}}', project])).stdout.trim()
       const secondBundles = (await readdir(managedDir)).filter((name) => name.startsWith('config-')).sort()
       expect(secondId).toBe(firstId)
@@ -101,7 +115,7 @@ await writeFile(path, JSON.stringify(manifest) + '\\n')
       await exec(cli, ['status', '--profile', 'web'], { env: environment, timeout: 60_000 })
       await exec(cli, ['doctor', '--profile', 'web'], { env: environment, timeout: 60_000 })
       await exec('docker', ['container', 'restart', project])
-      await exec(cli, ['setup', '--profile', 'web'], { env: environment, timeout: 180_000 })
+      await exec(cli, ['setup', '--managed', '--profile', 'web'], { env: environment, timeout: 180_000 })
       await exec(cli, ['doctor', '--profile', 'web'], { env: environment, timeout: 60_000 })
 
       // Repair leg: injure the generated bundle by deleting its .env while

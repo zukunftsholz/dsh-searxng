@@ -1,4 +1,14 @@
-# Development-only example. The supported user path is `npx dsh-searxng setup`.
+# Development-only example of an EXTERNAL SearXNG instance — the shape you point
+# the plugin at when you do not want it to manage a container:
+#
+#   docker compose up -d
+#   npx dsh-searxng setup --url http://127.0.0.1:8080
+#
+# `setup` never deploys SearXNG on its own; `setup --managed` is the path that
+# provisions and owns a container. This file exists so the external path can be
+# exercised without Docker management, and it carries no io.dsh-searxng.* labels
+# on purpose: the CLI must treat it as a foreign resource and refuse to adopt or
+# modify it.
 # Keep this JSON-enabled instance bound to loopback.
 services:
   searxng:
@@ -10,6 +20,7 @@ services:
       - ./searxng:/etc/searxng:ro
     environment:
       SEARXNG_BASE_URL: http://127.0.0.1:8080/
+      # SearXNG reads this and overrides server.secret_key from settings.yml.
       SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET to a random value}
     cap_drop:
       - ALL

@@ -4,8 +4,25 @@ import { join, normalize, resolve as resolvePath } from 'node:path'
 import type { CommandRunner } from './process.ts'
 import { CliError } from './errors.ts'
 
+/**
+ * Validate a profile name against the same rule the DSH launcher applies.
+ *
+ * The set is quoted from `resolveProfileDir` in `@deepseek-ai/dsh-app-boot`
+ * (0.2.1-rc.2), which rejects `""`, `.`, `..`, `node_modules`, and any name
+ * containing a path separator. Accepting a name dsh itself refuses would let
+ * the CLI write a profile directory the harness can never boot, so the check
+ * is kept identical rather than merely "safe enough" — `node_modules` in
+ * particular is a legal-looking name that would collide with dependency
+ * resolution inside `profiles/`.
+ * @param profile - the profile name from the command line.
+ * @returns the unchanged name.
+ * @throws {CliError} `E_PROFILE_INVALID` for every name dsh would reject.
+ */
 export function assertValidProfile(profile: string): string {
-  if (!profile || profile === '.' || profile === '..' || profile.includes('/') || profile.includes('\\')) {
+  if (
+    !profile || profile === '.' || profile === '..' || profile === 'node_modules' ||
+    profile.includes('/') || profile.includes('\\')
+  ) {
     throw new CliError('E_PROFILE_INVALID', 'Profile must be a safe name', 'Choose a profile without path separators or dot segments')
   }
   return profile
@@ -27,6 +44,42 @@ export function managedDir(dshHome: string): string { return join(dshHome, 'dsh-
 
 export function homeId(dshHome: string): string {
   return createHash('sha256').update(normalize(resolvePath(dshHome))).digest('hex').slice(0, 16)
+}
+
+/**
+ * Environment variable naming an explicit `dsh` executable to invoke.
+ *
+ * The CLI shells out to `dsh plugin --profile <name> add|remove` to manage
+ * profile plugins, so it needs a real, invocable CLI. A Desktop installation of
+ * DSH carries its CLI inside `resources/app.asar` and puts nothing named `dsh`
+ * on `PATH`, which makes the plugin unusable from such a machine even though a
+ * perfectly good CLI ships alongside the app. This variable closes that gap
+ * without hardcoding any installation path.
+ *
+ * An empty or whitespace-only value is treated as unset, matching how DSH
+ * itself reads `$DSH_HOME`.
+ */
+export const DSH_BIN_ENV = 'DSH_SEARXNG_DSH_BIN'
+
+/**
+ * Guidance for a missing `dsh` executable.
+ *
+ * Two cases must be distinguishable, so both are named: no CLI installed at
+ * all, and a Desktop-only install whose CLI exists but is not on `PATH`. The
+ * `@next` tag matters — `latest` is an older line this plugin does not support,
+ * so a bare install would leave the operator in a confusing incompatibility.
+ */
+export const DSH_MISSING_ACTION =
+  `Install the dsh CLI on PATH (npm install -g @deepseek-ai/dsh@next), or point ${DSH_BIN_ENV} at an existing dsh executable; a Desktop-only install carries its CLI inside resources/app.asar and exposes no dsh command`
+
+/**
+ * Resolve which `dsh` executable to invoke.
+ * @param env - the environment to read.
+ * @returns the configured executable, or `dsh` to resolve from `PATH`.
+ */
+export function resolveDshCommand(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env[DSH_BIN_ENV]?.trim()
+  return configured !== undefined && configured.length > 0 ? configured : 'dsh'
 }
 
 export interface ResolvedEnvironment { dshHome: string; profileDir: string; managedDir: string; homeId: string }
@@ -58,7 +111,7 @@ export class NodeEnvironmentService implements EnvironmentService {
     this.homedir = options.homedir ?? defaultHomedir()
     this.portChecker = options.portChecker
     this.commandRunner = options.commandRunner
-    this.dshCommand = options.dshCommand ?? 'dsh'
+    this.dshCommand = options.dshCommand ?? resolveDshCommand(this.env)
   }
   async resolve(profile: string): Promise<ResolvedEnvironment> {
     const dshHome = resolveDshHome(this.env, this.homedir)
@@ -85,7 +138,7 @@ export class NodeEnvironmentService implements EnvironmentService {
       if (result.exitCode !== 0) throw new Error('nonzero')
     } catch (error) {
       rethrowCancellation(error, signal)
-      throw new CliError('E_DSH_MISSING', 'The dsh executable is unavailable', 'Install dsh and ensure it is on PATH')
+      throw new CliError('E_DSH_MISSING', 'The dsh executable is unavailable', DSH_MISSING_ACTION)
     }
   }
 }

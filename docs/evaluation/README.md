@@ -78,6 +78,10 @@ a judgment. `--no-tune` skips the brackets where no dsh profile exists (the per-
 `unresponsive` capture still records engine failures); `.github/workflows/eval-window.yml`
 runs the battery on a GitHub-hosted runner as a labeled second network environment.
 
+The profile must already be attached. Since 0.5.0 `dsh-searxng setup` needs an explicit mode,
+so prepare the profile with `setup --managed` or `setup --url <endpoint>` before running a
+battery that reads `status --json`.
+
 ```sh
 # 1. Record the environment and configuration under test.
 npx dsh-searxng status --profile web --json
@@ -97,4 +101,9 @@ curl -sS -w '\n%{time_total}s\n' \
 ```
 
 Provider-level runs (through the dsh session, exercising pacing and the budget) substitute
-the `curl` step with searches issued in the dsh profile and are labeled as such.
+the `curl` step with searches issued in the dsh profile and are labeled as such. A provider
+run also covers `maxResults`, which the provider now applies at its own request layer.
+
+Every report must name the plugin version and harness line it ran against. Reports recorded
+before 0.5.0 describe the `0.1.x` harness line; their latency and maintenance numbers are not
+evidence for the current release.

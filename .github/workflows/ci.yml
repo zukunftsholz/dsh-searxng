@@ -27,6 +27,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Node 20 is the declared engine floor; Node 24 is the runtime the
+        # 0.2.1-rc.2 port was verified against.
         include:
           - os: ubuntu-latest
             node-version: 20
@@ -34,8 +36,18 @@ jobs:
             node-version: 24
           - os: macos-latest
             node-version: 20
+          - os: macos-latest
+            node-version: 24
+          # Four suites cover symlink refusal, which needs fs.symlink. Windows
+          # requires Administrator rights or Developer Mode for that, so those
+          # tests skip themselves on a host that cannot create a symlink. The
+          # gate is a capability probe, not a platform check: they run here on
+          # Linux and macOS, and on any Windows runner that has the privilege,
+          # so coverage is never silently dropped.
           - os: windows-latest
             node-version: 20
+          - os: windows-latest
+            node-version: 24
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -49,6 +61,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify
 
+  # The managed journey and the packed certification need a real Docker Engine
+  # and Compose v2. The plugin targets DeepSeek Harness 0.2.1-rc.2, so these legs
+  # pin Node 24, the version the port was verified against.
   docker-e2e:
     name: Managed Docker journey
     if: github.event_name == 'workflow_dispatch' && inputs.run_docker_e2e
@@ -62,7 +77,7 @@ jobs:
           run_install: false
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -98,7 +113,7 @@ jobs:
           run_install: false
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -124,8 +139,23 @@ jobs:
             let manifest = { dependencies: {} }
             try { manifest = JSON.parse(await readFile(path, 'utf8')) } catch {}
             manifest.dependencies ||= {}
-            if (action === 'add') manifest.dependencies['dsh-searxng'] = '0.1.1'
-            else delete manifest.dependencies['dsh-searxng']
+            // Mirror a real `dsh plugin add`: the package lands in
+            // `dependencies` AND is enrolled in `dsh.profile.bundles`, which is
+            // what makes the plugin's bundle layer insert its entry. Without
+            // the enrolment the profile's config row is silently skipped.
+            if (action === 'add') {
+              manifest.dependencies['dsh-searxng'] = '0.5.0'
+              manifest.dsh ||= {}
+              manifest.dsh.profile ||= {}
+              const bundles = Array.isArray(manifest.dsh.profile.bundles) ? manifest.dsh.profile.bundles : []
+              if (!bundles.includes('dsh-searxng')) bundles.push('dsh-searxng')
+              manifest.dsh.profile.bundles = bundles
+            } else {
+              delete manifest.dependencies['dsh-searxng']
+              if (Array.isArray(manifest.dsh?.profile?.bundles)) {
+                manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter((name) => name !== 'dsh-searxng')
+              }
+            }
             await writeFile(path, JSON.stringify(manifest) + '\n')
           }).catch(() => process.exit(2))
           EOF

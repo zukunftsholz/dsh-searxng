@@ -1,6 +1,14 @@
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { parse as parseYaml } from 'yaml'
+import {
+  bundleMountDiagnosis,
+  PLUGIN_NAME,
+  silentSkipConsequence,
+  type BundleMountReason,
+} from './bundle.ts'
+import type { SearxngMode } from '../index.ts'
+import { profileReadiness } from './bundle.ts'
 import type { DockerAdapter, DockerDeploymentStatus, HostPortBinding } from './docker.ts'
 import { CliError } from './errors.ts'
 import type { EnvironmentService } from './environment.ts'
@@ -236,7 +244,7 @@ export async function inspectSnapshot(
     }
   }
 
-  const { preview } = await observeAttachment(dependencies.profiles, profile, expectedEndpoint, signal)
+  const { preview } = await observeAttachment(dependencies.profiles, profile, expectedEndpoint, entry.mode, signal)
 
   const endpointHealth: DiagnosticSnapshot['endpoint'] = probeEndpoint
     ? await probeEndpointHealth(dependencies.searxng, preview?.config ?? { baseURL: expectedEndpoint }, signal)
@@ -287,6 +295,24 @@ function resourceForeign(): CliError {
 }
 
 /**
+ * The profile's config row is present but the plugin's bundle layer does not
+ * mount the entry it targets. Doctor reports this separately from attachment
+ * drift: the row is there and the endpoint answers, yet no provider is
+ * registered, so the symptom surfaces only at search time.
+ * @param reason - the observed composition reason.
+ * @returns the failure to report.
+ */
+function bundleNotMounted(reason: BundleMountReason): CliError {
+  const { message, action } = bundleMountDiagnosis(reason)
+  return new CliError(
+    'E_PROFILE_BUNDLE_MISSING',
+    `${message}; ${silentSkipConsequence()}`,
+    action,
+    { bundleMount: reason, plugin: PLUGIN_NAME },
+  )
+}
+
+/**
  * Shared attachment observation used by both `diagnose` and `inspectSnapshot`.
  * `diagnose` previews the profile's recorded endpoint so doctor can report
  * attachment drift; `inspectSnapshot` previews the state-truth endpoint
@@ -303,12 +329,13 @@ async function observeAttachment(
   profiles: ProfileManager,
   profile: string,
   endpoint: string,
+  mode: SearxngMode,
   signal?: AbortSignal,
 ): Promise<AttachmentObservation> {
   let preview: ProfileAttachmentPreview | undefined
   let previewError: unknown
   try {
-    preview = await profiles.preview(profile, endpoint, signal)
+    preview = await profiles.preview(profile, endpoint, signal, mode)
   } catch (error) {
     rethrowCancellation(error, signal)
     previewError = error
@@ -354,11 +381,12 @@ export async function validateEndToEnd(
   endpoint: string,
   dependencies: Pick<DiagnosticDependencies, 'profiles' | 'searxng'>,
   signal?: AbortSignal,
+  mode: SearxngMode = 'managed',
 ): Promise<DiagnosticCheck[]> {
   const checks: DiagnosticCheck[] = []
   let preview: ProfileAttachmentPreview | undefined
   try {
-    preview = await dependencies.profiles.preview(profile, endpoint, signal)
+    preview = await dependencies.profiles.preview(profile, endpoint, signal, mode)
   } catch (error) {
     rethrowCancellation(error, signal)
     preview = undefined
@@ -613,11 +641,42 @@ export async function diagnose(
   let preview: ProfileAttachmentPreview | undefined
   let previewError: unknown
   if (entry !== undefined) {
-    const observation = await observeAttachment(dependencies.profiles, profile, entry.endpoint, signal)
+    const observation = await observeAttachment(dependencies.profiles, profile, entry.endpoint, entry.mode, signal)
     preview = observation.preview
     previewError = observation.previewError
   }
 
+  // Report the deployment shape in force before anything that depends on it.
+  // `mode` decides whether Docker is part of this deployment at all, so it is
+  // reported as its own pass line rather than an aside: an operator debugging
+  // an external profile needs to see that Docker is out of scope here, not
+  // wonder why no Docker checks appeared.
+  //
+  // The readiness verdict comes from the plugin's own `describeSearxngProfile`
+  // rather than being re-derived here, so doctor and the provider can never
+  // disagree about what a given config means. `available` is deliberately
+  // mode-independent, so the *state* carries the distinction: `managed` with no
+  // endpoint is a legitimate pre-provisioning state, while `external` with no
+  // endpoint is a genuine misconfiguration.
+  if (entry !== undefined) {
+    const effective = preview?.config ?? { baseURL: entry.endpoint }
+    const readiness = profileReadiness({
+      mode: entry.mode,
+      baseURL: effective.baseURL,
+      ...(preview?.config?.baseURLs === undefined ? {} : { baseURLs: preview.config.baseURLs }),
+    })
+    const shape = entry.mode === 'managed'
+      ? 'managed (this installation owns a Docker SearXNG)'
+      : 'external (an existing SearXNG instance; Docker is not used)'
+    const detail = readiness === 'awaiting-managed-endpoint'
+      ? '; managed mode is selected but no endpoint is written yet, so searches are unavailable until setup completes'
+      : readiness === 'no-endpoint'
+        ? '; no endpoint is configured, so searches are unavailable until setup records one'
+        : readiness === 'invalid-endpoint'
+          ? '; the configured endpoint is not a valid HTTP(S) base URL'
+          : ''
+    checks.push({ id: 'mode', status: 'pass', message: `Deployment mode is ${shape}${detail}` })
+  }
   let deployment: DockerDeploymentStatus | undefined
   if (entry?.mode === 'managed') {
     await record('docker', 'Docker and Compose are available', async () => { await dependencies.docker.preflight(signal) })
@@ -644,6 +703,18 @@ export async function diagnose(
   }
 
   const config = preview?.config ?? (entry === undefined ? undefined : { baseURL: entry.endpoint })
+  // The failover pool outranks `baseURL` in the provider's own resolution, so a
+  // `baseURL` written by `setup --url` is not the endpoint actually in use while
+  // `baseURLs` is set. Report it rather than silently probing the wrong host:
+  // the operator set that pool deliberately, so the CLI neither clears nor
+  // reorders it, but it must not leave the mismatch invisible either.
+  if (preview?.config?.baseURLs !== undefined && preview.config.baseURLs.length > 0) {
+    checks.push({
+      id: 'endpoint-pool',
+      status: 'pass',
+      message: `baseURLs is set (${preview.config.baseURLs.length} entr${preview.config.baseURLs.length === 1 ? 'y' : 'ies'}, primary ${preview.config.baseURLs[0]}) and takes precedence over baseURL (${preview.config.baseURL}); searches use the pool until baseURLs is cleared`,
+    })
+  }
   await record('http', 'SearXNG HTTP endpoint is reachable', async () => {
     if (config === undefined) throw normalized(previewError)
     await dependencies.searxng.http(config, signal)
@@ -659,6 +730,22 @@ export async function diagnose(
   await record('profile', 'DSH profile has the expected managed attachment', async () => {
     if (previewError !== undefined) throw previewError
     if (preview === undefined || !preview.installed || !preview.attached) throw invalidState('DSH profile attachment is missing or outdated')
+  })
+  // The row and the bundle layer are two separate facts, and a profile can have
+  // the first without the second — the state a real machine was found in. The
+  // loader then drops the row with only a warning, `ctx.web` never sees the
+  // provider, and `web.searchProvider: searxng` throws
+  // WEB_PROVIDER_CONFIGURED_MISSING at search time. Nothing else in this chain
+  // notices, because the row reads as present and the HTTP endpoint is healthy.
+  await record('bundle', 'The dsh-searxng bundle layer mounts the provider entry', async () => {
+    if (previewError !== undefined) throw previewError
+    if (preview === undefined) throw invalidState('The DSH profile could not be inspected')
+    if (preview.mount === undefined || preview.mount.composes) return
+    // `package-missing` is real and actionable here: the profile lists the
+    // bundle but the package is not installed, so the layer is skipped. Only
+    // the CLI's write guard treats it as out of scope, because there the
+    // install failure is reported with more precision.
+    throw bundleNotMounted(preview.mount.reason ?? 'not-enrolled')
   })
   await record('provider', 'DSH provider search returned a result', async () => {
     if (entry === undefined) throw invalidState('Profile attachment state is missing')

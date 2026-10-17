@@ -5,12 +5,13 @@ import { realpath } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
-import { parseCliArgs } from './cli/args.ts'
+import { ArgumentError, parseCliArgs } from './cli/args.ts'
+import { readSelfPackage } from './cli/bundle.ts'
 import { FileAssetRenderer, type StagingAssetRenderer } from './cli/assets.ts'
 import { CliDockerAdapter } from './cli/docker.ts'
 import { loadDeploymentCatalog, type DeploymentDefinition } from './cli/deployments.ts'
 import { diagnose, formatAge, formatPrivacyPosture, inspectSnapshot, type SnapshotDependencies } from './cli/diagnostics.ts'
-import { homeId, managedDir, NodeEnvironmentService, resolveDshHome, type PortChecker } from './cli/environment.ts'
+import { homeId, managedDir, NodeEnvironmentService, resolveDshCommand, resolveDshHome, type PortChecker } from './cli/environment.ts'
 import { CliError } from './cli/errors.ts'
 import { FileJournalStore, type JournalStore } from './cli/journal.ts'
 import { presentError, presentPublicSuccess, presentSuccess } from './cli/presenter.ts'
@@ -76,7 +77,8 @@ function usageError(message: string): CliError {
 const HELP = `dsh-searxng
 
 Usage:
-  dsh-searxng setup [--profile NAME] [--port PORT] [--url URL] [--json]
+  dsh-searxng setup --url URL [--profile NAME] [--json]
+  dsh-searxng setup --managed [--profile NAME] [--port PORT] [--json]
   dsh-searxng status [--profile NAME] [--json]
   dsh-searxng doctor [--profile NAME] [--json]
   dsh-searxng tune [--profile NAME] [--json]
@@ -85,13 +87,16 @@ Usage:
   dsh-searxng remove [--profile NAME] [--service] [--purge-data --yes] [--json]
 
 Commands:
-  setup    Configure an external SearXNG endpoint or create an owned Docker service
+  setup    Use an existing SearXNG (--url) or explicitly provision one (--managed)
   status   Stop at the first failed health check
   doctor   Report the complete ordered diagnostic chain
   tune     Run the read-only engine-health probe battery and report evidence
   repair   Plan and execute ownership-safe repairs for the managed deployment
   update   Move the managed deployment to a packaged version with verified rollback
   remove   Detach a profile, optionally removing the owned service and data
+
+setup never provisions a container unless you pass --managed: --url points at an
+existing instance and never invokes Docker.
 `
 
 const UPDATE_PHASE_NARRATION: Readonly<Record<UpdatePhase, string>> = {
@@ -277,13 +282,18 @@ export function createProductionDependencies(options: ProductionDependencyOption
   const dshHome = resolveDshHome(env, options.homedir)
   const runner = options.runner ?? new NodeProcessRunner()
   const portChecker = options.portChecker ?? createLoopbackPortChecker()
+  // One resolution for the whole process, so `environment` and `profiles` can
+  // never disagree about which `dsh` executable they manage the profile with,
+  // and about which package spec they install.
+  const dshCommand = resolveDshCommand(env)
+  const { spec: pluginSpec } = readSelfPackage(import.meta.url, env)
   return {
-    environment: new NodeEnvironmentService({ env, homedir: options.homedir, portChecker, commandRunner: runner }),
+    environment: new NodeEnvironmentService({ env, homedir: options.homedir, portChecker, commandRunner: runner, dshCommand }),
     state: new FileStateStore(managedDir(dshHome), homeId(dshHome)),
     docker: new CliDockerAdapter(runner),
     assets: new FileAssetRenderer(),
     searxng: new DefaultSearxngProbe(),
-    profiles: new NodeProfileManager({ commandRunner: runner, dshHome }),
+    profiles: new NodeProfileManager({ commandRunner: runner, dshHome, dshCommand, pluginSpec }),
     now: () => new Date(),
     catalog: loadDeploymentCatalog(),
     confirmPurge,
@@ -301,7 +311,21 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
   let command
   try {
     command = parseCliArgs(argv)
-  } catch {
+  } catch (error) {
+    // A mode error is the one argument failure the operator can act on without
+    // re-reading the help: it names the two ways forward. Reporting it as a
+    // generic usage error would bury that decision.
+    if (error instanceof ArgumentError && error.code !== 'E_USAGE') {
+      presentError(new CliError(
+        error.code,
+        error.message,
+        error.code === 'E_MODE_REQUIRED'
+          ? 'Pass --url <endpoint> to use an existing SearXNG, or --managed to provision one with Docker'
+          : 'Pass --url <endpoint> for an existing SearXNG, or --managed alone to provision one',
+        { modes: ['external', 'managed'] },
+      ), presenter)
+      return 2
+    }
     presentError(usageError('Invalid command arguments'), presenter)
     return 2
   }
@@ -317,6 +341,7 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
       const result = await setup(
         {
           profile: command.profile,
+          mode: command.mode,
           port: command.port,
           portExplicit: command.portExplicit,
           ...(command.url === undefined ? {} : { url: command.url }),
@@ -325,15 +350,19 @@ export async function runCli(argv: readonly string[], options: RunCliOptions = {
         options.signal,
       )
       if (format === 'json') presentSuccess(result, presenter)
-      else stdout([
+      else {
+        stdout([
           'SearXNG ready',
           `Profile: ${result.profile}`,
           `Endpoint: ${result.endpoint}`,
+          `Mode: ${result.mode}`,
           'Validation: real search and provider search passed',
           `Deployment: ${result.reused ? 'reused' : 'created or recovered'}`,
           `Next: dsh --profile ${result.profile}`,
+          ...(result.warning === undefined ? [] : ['', `Warning: ${result.warning}`]),
           '',
         ].join('\n'))
+      }
       return 0
     }
 

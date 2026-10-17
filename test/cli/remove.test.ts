@@ -235,6 +235,52 @@ describe('remove', () => {
     expect(test.events).toEqual([])
   })
 
+  it('refuses --service for an external-mode profile instead of silently doing nothing', async () => {
+    // An external profile owns no Docker resources. Exiting 0 would let an
+    // operator believe a container was removed when none was ever owned.
+    const external: StateV2 = {
+      schemaVersion: 2,
+      homeId: HOME_ID,
+      profiles: { web: { mode: 'external', endpoint: ENDPOINT } },
+    }
+    const test = harness({ state: external })
+    const error = await remove({ profile: 'web', service: true, purgeData: false, confirmed: false }, test.dependencies)
+      .catch((cause: unknown) => cause)
+    expect(error).toMatchObject({ code: 'E_MODE_MISMATCH', details: { mode: 'external' } })
+    expect((error as CliError).message).toMatch(/owns no Docker service/i)
+    expect((error as CliError).action).toMatch(/without --service/i)
+    // No Docker work, no detachment, no state write: the refusal is total.
+    expect(test.dependencies.docker.down).not.toHaveBeenCalled()
+    expect(test.dependencies.docker.preflight).not.toHaveBeenCalled()
+    expect(test.dependencies.profiles.detach).not.toHaveBeenCalled()
+    expect(test.events).toEqual([])
+  })
+
+  it('refuses --service --purge-data for an external-mode profile the same way', async () => {
+    const external: StateV2 = {
+      schemaVersion: 2,
+      homeId: HOME_ID,
+      profiles: { web: { mode: 'external', endpoint: ENDPOINT } },
+    }
+    const test = harness({ state: external, confirmed: true })
+    await expect(remove({ profile: 'web', service: true, purgeData: true, confirmed: true }, test.dependencies))
+      .rejects.toMatchObject({ code: 'E_MODE_MISMATCH' })
+    expect(test.dependencies.docker.down).not.toHaveBeenCalled()
+  })
+
+  it('still detaches an external-mode profile when --service is not requested', async () => {
+    const external: StateV2 = {
+      schemaVersion: 2,
+      homeId: HOME_ID,
+      profiles: { web: { mode: 'external', endpoint: ENDPOINT } },
+    }
+    const test = harness({ state: external })
+    const result = await remove({ profile: 'web', service: false, purgeData: false, confirmed: false }, test.dependencies)
+    expect(result).toMatchObject({ profile: 'web', profileRemoved: true, serviceRemoved: false, dataPurged: false })
+    expect(test.dependencies.profiles.detach).toHaveBeenCalled()
+    expect(test.dependencies.docker.down).not.toHaveBeenCalled()
+  })
+
   it('can retry a plugin uninstall after state and patch were already detached', async () => {
     const test = harness({ uninstallFailures: 1 })
     await expect(remove({ profile: 'web', service: false, purgeData: false, confirmed: false }, test.dependencies))

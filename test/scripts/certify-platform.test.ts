@@ -120,12 +120,14 @@ const createHappyJourney = () => {
     const command = args[1]
     if (command === 'setup') {
       const repeated = world.calls.filter((call) => call.file === 'node' && call.args[1] === 'setup').length > 1
+      // The runner certifies the managed journey, so it passes --managed and the
+      // report must say so; the stub mirrors the real CLI's report shape.
       if (!repeated) {
         world.files.set(statePath, stateJson())
         world.files.set(bundleEnv, 'DSH_SEARXNG_IMAGE=...\n')
-        return { code: 0, stdout: `${JSON.stringify({ profile: 'web', endpoint, reused: false })}\n` }
+        return { code: 0, stdout: `${JSON.stringify({ profile: 'web', endpoint, mode: 'managed', reused: false })}\n` }
       }
-      return { code: 0, stdout: `${JSON.stringify({ profile: 'web', endpoint, reused: true })}\n` }
+      return { code: 0, stdout: `${JSON.stringify({ profile: 'web', endpoint, mode: 'managed', reused: true })}\n` }
     }
     if (command === 'status') return { code: 0, stdout: `${JSON.stringify({ profile: 'web', mode: 'managed', endpoint, healthy: true, checks: [] })}\n` }
     if (command === 'doctor') return healthyDoctor()
@@ -332,6 +334,18 @@ describe('runCertification', () => {
       expect(call.env?.DSH_HOME).toBe(dshHome)
       expect(call.args).toContain('--profile')
       expect(call.args[call.args.indexOf('--profile') + 1]).toBe('web')
+    }
+
+    // This runner certifies the MANAGED journey, so both setup invocations must
+    // pass --managed explicitly. `setup` deliberately has no default mode: a
+    // runner that omitted it would fail with E_MODE_REQUIRED and report every
+    // downstream check as `skip`, which reads like a broken plugin rather than
+    // an out-of-date runner.
+    const setupCalls = cliCalls.filter((call) => call.args[1] === 'setup')
+    expect(setupCalls).toHaveLength(2)
+    for (const call of setupCalls) {
+      expect(call.args).toContain('--managed')
+      expect(call.args).not.toContain('--url')
     }
 
     // The tarball was installed without lifecycle scripts into the temp project.

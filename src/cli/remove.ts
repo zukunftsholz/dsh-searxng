@@ -25,6 +25,21 @@ function blocked(message: string): CliError {
   return new CliError('E_REMOVE_BLOCKED', message, 'Detach the remaining managed profiles, then retry')
 }
 
+/**
+ * `--service` / `--purge-data` address Docker resources this installation owns.
+ * A profile in external mode owns none, so the flags have nothing to act on and
+ * silently exiting 0 would let an operator believe a container was removed.
+ * @returns the precise refusal.
+ */
+function nothingOwnedInExternalMode(): CliError {
+  return new CliError(
+    'E_MODE_MISMATCH',
+    'The selected profile uses an existing SearXNG instance (mode: external) and owns no Docker service, so there is nothing to remove',
+    'Run dsh-searxng remove without --service; a managed profile is removed with --service',
+    { mode: 'external' },
+  )
+}
+
 function removalFailed(message: string): CliError {
   return new CliError('E_INTERNAL', message, 'Run dsh-searxng doctor and retry the removal')
 }
@@ -96,11 +111,15 @@ export async function remove(
       .filter(([profile, value]) => profile !== input.profile && value.mode === 'managed')
       .map(([profile]) => profile)
     if (input.service && otherManaged.length > 0) throw blocked(`Managed service is still attached to: ${otherManaged.join(', ')}`)
+    // `--service` addresses Docker resources this installation owns. An
+    // external-mode profile owns none, so the flag is refused explicitly rather
+    // than succeeding as a no-op that implies a container was removed.
+    if (input.service && entry?.mode === 'external') throw nothingOwnedInExternalMode()
     // Without a recorded interruption, --service against a state without a
     // managed deployment is a likely mistake and stays blocked. With one, the
     // operator is cleaning up after a crash (exactly what blocked recovery
     // guidance directs), so removal is allowed to proceed and clear it.
-    if (input.service && (entry?.mode === 'external' || (managed === undefined && interrupted === undefined))) {
+    if (input.service && managed === undefined && interrupted === undefined) {
       throw blocked('The selected profile does not own a managed service')
     }
 

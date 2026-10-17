@@ -9,6 +9,16 @@
  * backoff delay, and every network attempt. Attempt counts are a secondary
  * guard; the budget is the primary latency bound.
  *
+ * The session takes an options RESOLVER rather than a frozen options object.
+ * Under DSH 0.2.1-rc.2 plugin config is volatile: the settings section can
+ * change between searches, and re-registering the provider to carry a new
+ * endpoint would make the seam's selection flicker for the user. The resolver
+ * is therefore called exactly once per `search()` and its result drives that
+ * whole operation, so one search never mixes two sections. Cache and endpoint
+ * health survive a settings edit; the cache key already includes every
+ * request-shaping option, so entries written under an old section are simply
+ * never hit again.
+ *
  * @module dsh-searxng/search-session
  */
 
@@ -31,7 +41,7 @@ export interface SearxngSearchSessionOptions extends SearxngClientOptions {
    * Failover pool of SearXNG base URLs; the first entry is primary. A non-empty
    * list wins over `baseURL`. Absent or empty keeps single-`baseURL` behavior.
    */
-  baseURLs?: string[]
+  baseURLs?: readonly string[]
   /** Cached entry lifetime in milliseconds; 0 disables caching. Default 600_000. */
   cacheTtlMs?: number
   /** Maximum cached entries (LRU). Default 64. */
@@ -43,6 +53,13 @@ export interface SearxngSearchSessionOptions extends SearxngClientOptions {
   /** Total wall-clock budget for one search call. Default 15_000. */
   totalBudgetMs?: number
 }
+
+/**
+ * Supply the options for the NEXT operation. Called once at each operation's
+ * entry so a settings change applies to the next search without re-registering
+ * the provider.
+ */
+export type SearxngSearchSessionOptionsResolver = () => SearxngSearchSessionOptions
 
 const DEFAULT_CACHE_TTL_MS = 600_000
 const DEFAULT_CACHE_CAPACITY = 64
@@ -63,7 +80,12 @@ const HEALTH_EPSILON = 0.25
  */
 export function resolveEndpointPool(options: { baseURL?: string; baseURLs?: readonly string[] }): string[] {
   const listed = options.baseURLs
-  if (listed === undefined || listed.length === 0) return [options.baseURL ?? '']
+  if (listed === undefined) return [options.baseURL ?? '']
+  // Volatile config reaches this function without a remount, so a shape that
+  // the schema would have rejected must still fail loudly instead of being
+  // iterated as characters.
+  if (!Array.isArray(listed)) throw new RangeError('baseURLs must be a list of strings')
+  if (listed.length === 0) return [options.baseURL ?? '']
   for (const entry of listed) {
     if (typeof entry !== 'string') throw new RangeError('baseURLs entries must be strings')
   }
@@ -80,6 +102,19 @@ interface EndpointHealth {
   lastFailureAt: number
 }
 
+/** One operation's fully validated, defaulted view of the settings section. */
+interface SessionSnapshot {
+  readonly options: SearxngSearchSessionOptions
+  readonly pool: readonly string[]
+  readonly cacheTtlMs: number
+  readonly cacheCapacity: number
+  readonly minIntervalMs: number
+  readonly queueCapacity: number
+  readonly totalBudgetMs: number
+  readonly perAttemptTimeoutMs: number
+  readonly retryDelayMs: number
+}
+
 interface CacheEntry {
   readonly expiresAt: number
   readonly value: SearxngClientResult
@@ -93,29 +128,38 @@ interface PacerWaiter {
   onAbort(): void
 }
 
+/** The pacing limits of the operation currently being admitted. */
+interface PacerLimits {
+  readonly intervalMs: number
+  readonly queueCapacity: number
+}
+
 /**
  * Token bucket with a bounded FIFO of waiting acquirers. Tokens refill
  * continuously; a full queue rejects immediately (`busy`) instead of holding
  * the caller, and every wait is abortable. Pacing is provider-instance-local:
  * it cannot coordinate other processes sharing the same instance or IP.
+ *
+ * Limits are read per admission from the caller's resolver rather than frozen
+ * at construction. Volatile settings can change a rate between searches, and a
+ * rebuilt bucket would hand out a fresh burst — charging the new rate against
+ * the existing bucket is both simpler and stricter than resetting it.
  */
 class Pacer {
   private tokens: number
   private lastRefillAt: number
   private readonly waiters: PacerWaiter[] = []
   private wakeTimer: ReturnType<typeof setTimeout> | undefined
+  private intervalMs = 1_500
 
-  constructor(
-    private readonly capacity: number,
-    private readonly intervalMs: number,
-    private readonly queueCapacity: number,
-  ) {
+  constructor(private readonly capacity = 2) {
     this.tokens = capacity
     this.lastRefillAt = Date.now()
   }
 
-  acquire(deadlineAt: number, signal?: AbortSignal): Promise<void> {
-    if (this.waiters.length >= this.queueCapacity) {
+  acquire(limits: PacerLimits, deadlineAt: number, signal?: AbortSignal): Promise<void> {
+    this.intervalMs = limits.intervalMs
+    if (this.waiters.length >= limits.queueCapacity) {
       return Promise.reject(new SearxngClientError(
         'busy',
         'SearXNG provider pacing queue is full; retry after in-flight searches settle',
@@ -198,86 +242,59 @@ class Pacer {
 }
 
 export class SearxngSearchSession {
-  private readonly options: SearxngSearchSessionOptions
-  private readonly pool: readonly string[]
-  private readonly health: ReadonlyMap<string, EndpointHealth>
-  private readonly pacers: ReadonlyMap<string, Pacer> | undefined
-  private readonly cacheTtlMs: number
-  private readonly cacheCapacity: number
-  private readonly totalBudgetMs: number
-  private readonly perAttemptTimeoutMs: number
-  private readonly retryDelayMs: number
+  private readonly resolveOptions: SearxngSearchSessionOptionsResolver
   private readonly cache = new Map<string, CacheEntry>()
+  private readonly health = new Map<string, EndpointHealth>()
+  /** Per-endpoint buckets; created on first use and kept for the instance. */
+  private readonly pacers = new Map<string, Pacer>()
 
-  constructor(options: SearxngSearchSessionOptions) {
-    const {
-      cacheTtlMs = DEFAULT_CACHE_TTL_MS,
-      cacheCapacity = DEFAULT_CACHE_CAPACITY,
-      minIntervalMs = DEFAULT_MIN_INTERVAL_MS,
-      queueCapacity = DEFAULT_QUEUE_CAPACITY,
-      totalBudgetMs = DEFAULT_TOTAL_BUDGET_MS,
-    } = options
-    if (!Number.isSafeInteger(cacheTtlMs) || cacheTtlMs < 0) {
-      throw new RangeError('cacheTtlMs must be a non-negative safe integer')
-    }
-    if (!Number.isSafeInteger(cacheCapacity) || cacheCapacity < 1) {
-      throw new RangeError('cacheCapacity must be a positive safe integer')
-    }
-    if (!Number.isSafeInteger(minIntervalMs) || minIntervalMs < 0) {
-      throw new RangeError('minIntervalMs must be a non-negative safe integer')
-    }
-    if (!Number.isSafeInteger(queueCapacity) || queueCapacity < 1) {
-      throw new RangeError('queueCapacity must be a positive safe integer')
-    }
-    if (!Number.isSafeInteger(totalBudgetMs) || totalBudgetMs < 1) {
-      throw new RangeError('totalBudgetMs must be a positive safe integer')
-    }
-    this.options = options
-    this.pool = resolveEndpointPool(options)
-    this.health = new Map(this.pool.map((endpoint) => [endpoint, { penalty: 0, lastFailureAt: 0 }]))
-    this.cacheTtlMs = cacheTtlMs
-    this.cacheCapacity = cacheCapacity
-    this.totalBudgetMs = totalBudgetMs
-    this.perAttemptTimeoutMs = options.timeoutMs ?? 10_000
-    this.retryDelayMs = options.retryDelayMs ?? 100
-    this.pacers = minIntervalMs === 0
-      ? undefined
-      : new Map(this.pool.map((endpoint) => [endpoint, new Pacer(2, minIntervalMs, queueCapacity)]))
+  /**
+   * @param resolveOptions - the options for the next operation. A thunk rather
+   *   than a value because the plugin's settings section is volatile and can
+   *   change between searches.
+   */
+  constructor(resolveOptions: SearxngSearchSessionOptionsResolver) {
+    this.resolveOptions = resolveOptions
   }
 
   /** Run one search through instance-local cache, pacing, and the total budget. */
   async search(query: string, signal?: AbortSignal): Promise<SearxngClientResult> {
     if (signal?.aborted) throw new SearxngClientError('caller-abort', 'SearXNG search aborted')
-    if (!this.pool.every(isValidSearxngBaseUrl)) {
+    const snapshot = this.snapshot()
+    if (!snapshot.pool.every(isValidSearxngBaseUrl)) {
       throw new SearxngClientError('invalid-url', 'SearXNG base URL is invalid')
     }
-    const key = this.cacheKey(query)
-    const cached = this.readCached(key)
+    const key = cacheKey(snapshot, query)
+    const cached = this.readCached(snapshot, key)
     if (cached !== undefined) return structuredClone(cached)
 
-    const deadlineAt = Date.now() + this.totalBudgetMs
+    const deadlineAt = Date.now() + snapshot.totalBudgetMs
+    const limits: PacerLimits = {
+      intervalMs: snapshot.minIntervalMs,
+      queueCapacity: snapshot.queueCapacity,
+    }
     let lastFailure: SearxngClientError | undefined
     let rateLimitBackoffUsed = false
     let pacingEndpoint: string | undefined
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       const remaining = deadlineAt - Date.now()
       if (remaining <= 0) throw lastFailure ?? budgetExpired()
-      const endpoint = this.selectEndpoint()
+      const endpoint = this.selectEndpoint(snapshot)
       // Pacing is per endpoint: a failover attempt waits only on the endpoint it
       // targets, and same-endpoint retries keep the slot acquired for attempt 1.
       if (endpoint !== pacingEndpoint) {
-        await this.pacers?.get(endpoint)?.acquire(deadlineAt, signal)
+        await this.pacerFor(endpoint, snapshot)?.acquire(limits, deadlineAt, signal)
         pacingEndpoint = endpoint
       }
       let outcome: Awaited<ReturnType<typeof requestJsonWithRetry>>
       try {
         outcome = await requestJsonWithRetry({
-          url: buildSearchUrl(endpoint, buildSearxngSearchParams(this.options, query)),
-          headers: searxngRequestHeaders(this.options),
+          url: buildSearchUrl(endpoint, buildSearxngSearchParams(snapshot.options, query)),
+          headers: searxngRequestHeaders(snapshot.options),
           ...(signal === undefined ? {} : { signal }),
-          timeoutMs: Math.max(1, Math.min(this.perAttemptTimeoutMs, Math.ceil(remaining))),
+          timeoutMs: Math.max(1, Math.min(snapshot.perAttemptTimeoutMs, Math.ceil(remaining))),
           maxAttempts: 1,
-          ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
+          ...(snapshot.options.fetch === undefined ? {} : { fetch: snapshot.options.fetch }),
         })
       } catch (error) {
         if (!(error instanceof SearxngClientError)) throw error
@@ -285,7 +302,7 @@ export class SearxngSearchSession {
         lastFailure = error
         this.recordFailure(endpoint)
         if (attempt === MAX_ATTEMPTS) throw error
-        const delay = Math.min(this.retryDelayMs, deadlineAt - Date.now() - 1)
+        const delay = Math.min(snapshot.retryDelayMs, deadlineAt - Date.now() - 1)
         if (delay <= 0) throw error
         await abortableDelay(delay, signal)
         continue
@@ -297,7 +314,7 @@ export class SearxngSearchSession {
         }
         const mapped = mapSearxngClientResponse(outcome.payload)
         this.recordSuccess(endpoint)
-        this.writeCached(key, mapped)
+        this.writeCached(snapshot, key, mapped)
         return mapped
       }
 
@@ -307,7 +324,7 @@ export class SearxngSearchSession {
       const rateLimited = status === 429 && !rateLimitBackoffUsed
       if (!retryableStatus && !rateLimited) throw lastFailure
       this.recordFailure(endpoint)
-      let delay = this.retryDelayMs
+      let delay = snapshot.retryDelayMs
       if (status === 429) {
         rateLimitBackoffUsed = true
         delay = parseRetryAfterMs(outcome.response.headers.get('retry-after'))
@@ -322,14 +339,69 @@ export class SearxngSearchSession {
   }
 
   /**
+   * Resolve and validate one operation's settings. A misconfigured knob is a
+   * typed `config` failure rather than a constructor-time throw: volatile
+   * settings can change after the plugin mounted, and a settings edit must
+   * surface as an actionable search error instead of killing the provider.
+   */
+  private snapshot(): SessionSnapshot {
+    const options = this.resolveOptions()
+    if (options === null || typeof options !== 'object') {
+      throw new SearxngClientError('config', 'SearXNG provider options must be an object')
+    }
+    const cacheTtlMs = requireIntegerSetting(options.cacheTtlMs, DEFAULT_CACHE_TTL_MS, 0, 'cacheTtlMs')
+    const cacheCapacity = requireIntegerSetting(options.cacheCapacity, DEFAULT_CACHE_CAPACITY, 1, 'cacheCapacity')
+    const minIntervalMs = requireIntegerSetting(options.minIntervalMs, DEFAULT_MIN_INTERVAL_MS, 0, 'minIntervalMs')
+    const queueCapacity = requireIntegerSetting(options.queueCapacity, DEFAULT_QUEUE_CAPACITY, 1, 'queueCapacity')
+    const totalBudgetMs = requireIntegerSetting(options.totalBudgetMs, DEFAULT_TOTAL_BUDGET_MS, 1, 'totalBudgetMs')
+    let pool: string[]
+    try {
+      pool = resolveEndpointPool(options)
+    } catch (error) {
+      throw new SearxngClientError(
+        'config',
+        error instanceof Error ? error.message : 'baseURLs is invalid',
+        undefined,
+        { cause: error },
+      )
+    }
+    return {
+      options,
+      pool,
+      cacheTtlMs,
+      cacheCapacity,
+      minIntervalMs,
+      queueCapacity,
+      totalBudgetMs,
+      perAttemptTimeoutMs: options.timeoutMs ?? 10_000,
+      retryDelayMs: options.retryDelayMs ?? 100,
+    }
+  }
+
+  /**
+   * The bucket for one endpoint, or `undefined` when pacing is off. Buckets are
+   * per endpoint (a failover attempt waits only on the endpoint it targets) and
+   * live for the instance, so an unrelated settings edit never restarts the
+   * pacing window; only the limits are re-read per admission.
+   */
+  private pacerFor(endpoint: string, snapshot: SessionSnapshot): Pacer | undefined {
+    if (snapshot.minIntervalMs === 0) return undefined
+    const existing = this.pacers.get(endpoint)
+    if (existing !== undefined) return existing
+    const created = new Pacer()
+    this.pacers.set(endpoint, created)
+    return created
+  }
+
+  /**
    * Lowest quantized effective penalty wins; ties resolve to pool order, so the
    * primary is sticky and regains the first slot once its penalty decays below
    * the epsilon (about two half-lives after its last failure).
    */
-  private selectEndpoint(): string {
+  private selectEndpoint(snapshot: SessionSnapshot): string {
     let best: string | undefined
     let bestScore = Number.POSITIVE_INFINITY
-    for (const endpoint of this.pool) {
+    for (const endpoint of snapshot.pool) {
       const score = this.effectivePenalty(this.health.get(endpoint))
       if (score < bestScore) {
         best = endpoint
@@ -350,10 +422,12 @@ export class SearxngSearchSession {
   }
 
   private recordFailure(endpoint: string): void {
-    const health = this.health.get(endpoint)
-    if (health === undefined) return
+    // Health outlives a settings edit, so an endpoint first seen under a new
+    // pool starts from a clean record here rather than a pre-seeded one.
+    const health = this.health.get(endpoint) ?? { penalty: 0, lastFailureAt: 0 }
     health.penalty += 1
     health.lastFailureAt = Date.now()
+    this.health.set(endpoint, health)
   }
 
   private recordSuccess(endpoint: string): void {
@@ -362,21 +436,8 @@ export class SearxngSearchSession {
     health.penalty = 0
   }
 
-  private cacheKey(query: string): string {
-    // Exact query text (syntax and case preserved) plus every resolved
-    // request-shaping option and the pool identity: one pool serves equivalent
-    // content, so entries are shared across its endpoints, not per endpoint.
-    return JSON.stringify([
-      this.pool,
-      this.options.language ?? '',
-      this.options.engines ?? '',
-      this.options.categories ?? '',
-      query,
-    ])
-  }
-
-  private readCached(key: string): SearxngClientResult | undefined {
-    if (this.cacheTtlMs === 0) return undefined
+  private readCached(snapshot: SessionSnapshot, key: string): SearxngClientResult | undefined {
+    if (snapshot.cacheTtlMs === 0) return undefined
     const entry = this.cache.get(key)
     if (entry === undefined) return undefined
     if (Date.now() >= entry.expiresAt) {
@@ -389,20 +450,45 @@ export class SearxngSearchSession {
     return entry.value
   }
 
-  private writeCached(key: string, value: SearxngClientResult): void {
-    if (this.cacheTtlMs === 0) return
+  private writeCached(snapshot: SessionSnapshot, key: string, value: SearxngClientResult): void {
+    if (snapshot.cacheTtlMs === 0) return
     // An empty page is a success but carries no reusable information; caching
     // it would mask upstream recovery for the whole TTL (observed in the
     // 2026-09-11 evaluation: a cooled-down instance served stale empties).
     if (value.sources.length === 0) return
     this.cache.delete(key)
-    this.cache.set(key, { expiresAt: Date.now() + this.cacheTtlMs, value })
-    while (this.cache.size > this.cacheCapacity) {
+    this.cache.set(key, { expiresAt: Date.now() + snapshot.cacheTtlMs, value })
+    while (this.cache.size > snapshot.cacheCapacity) {
       const oldest = this.cache.keys().next()
       if (oldest.done === true) break
       this.cache.delete(oldest.value)
     }
   }
+}
+
+/**
+ * Cache identity: the exact query text (syntax and case preserved), every
+ * resolved request-shaping option, and the pool. One pool serves equivalent
+ * content, so entries are shared across its endpoints, not per endpoint.
+ */
+function cacheKey(snapshot: SessionSnapshot, query: string): string {
+  return JSON.stringify([
+    snapshot.pool,
+    snapshot.options.language ?? '',
+    snapshot.options.engines ?? '',
+    snapshot.options.categories ?? '',
+    query,
+  ])
+}
+
+/** Validate one numeric knob from the current section; `minimum` is inclusive. */
+function requireIntegerSetting(value: number | undefined, fallback: number, minimum: number, name: string): number {
+  const resolved = value ?? fallback
+  if (!Number.isSafeInteger(resolved) || resolved < minimum) {
+    const bound = minimum === 0 ? 'a non-negative safe integer' : `a positive safe integer`
+    throw new SearxngClientError('config', `${name} must be ${bound}`)
+  }
+  return resolved
 }
 
 function budgetExpired(): SearxngClientError {

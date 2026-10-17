@@ -398,11 +398,21 @@ export async function runCertification(input) {
 
   async function stepSetup() {
     setupAttempted = true
-    const command = [node, cliModule(), 'setup', '--profile', profile, '--json']
-    const result = await runCli(['setup', '--profile', profile, '--json'], { timeoutMs: TIMEOUTS.setup })
+    // `--managed` is explicit and required: this runner certifies the MANAGED
+    // journey (Docker provisioning, ownership labels, config digests, container
+    // reuse, remove --service --purge-data). `setup` deliberately has no default
+    // mode — it never provisions a container unless asked — so omitting the flag
+    // makes the step fail with E_MODE_REQUIRED and, worse, makes every downstream
+    // check report `skip`, which reads in the report like a broken plugin rather
+    // than an out-of-date runner.
+    const command = [node, cliModule(), 'setup', '--managed', '--profile', profile, '--json']
+    const result = await runCli(['setup', '--managed', '--profile', profile, '--json'], { timeoutMs: TIMEOUTS.setup })
     const report = result.code === 0 ? parseJson(result.stdout, 'setup', { command, result }) : undefined
     assert(result.code === 0 && report?.profile === profile, `setup did not complete for profile ${profile}`, { command, result })
     assert(report.reused === false, 'the first setup reported reuse instead of creation', { command, result })
+    // The report records the deployment shape it configured. Certifying the
+    // managed journey means proving the managed shape was actually written.
+    assert(report.mode === 'managed', `setup recorded mode ${JSON.stringify(report.mode)} instead of "managed"`, { command, result })
     assert(typeof report.endpoint === 'string' && /^http:\/\/127\.0\.0\.1:\d+$/.test(report.endpoint), 'setup did not report a loopback managed endpoint', { command, result })
     const current = await currentDeployment()
     assert(Number.isSafeInteger(current.deploymentVersion) && current.deploymentVersion >= 1, 'state records no deployment version')
@@ -416,10 +426,11 @@ export async function runCertification(input) {
   async function stepRepeatSetup() {
     const before = await currentDeployment()
     const firstId = await containerIdFor(before.containerName)
-    const command = [node, cliModule(), 'setup', '--profile', profile, '--json']
-    const result = await runCli(['setup', '--profile', profile, '--json'], { timeoutMs: TIMEOUTS.setup })
+    const command = [node, cliModule(), 'setup', '--managed', '--profile', profile, '--json']
+    const result = await runCli(['setup', '--managed', '--profile', profile, '--json'], { timeoutMs: TIMEOUTS.setup })
     const report = result.code === 0 ? parseJson(result.stdout, 'setup', { command, result }) : undefined
     assert(result.code === 0 && report?.reused === true, 'repeated setup did not reuse the existing deployment', { command, result })
+    assert(report.mode === 'managed', `repeated setup recorded mode ${JSON.stringify(report.mode)} instead of "managed"`, { command, result })
     const after = await currentDeployment()
     assert(after.configurationSha256 === before.configurationSha256, 'repeated setup rendered a different configuration bundle', { command, result })
     assert(await containerIdFor(after.containerName) === firstId, 'repeated setup replaced the owned container', { command, result })

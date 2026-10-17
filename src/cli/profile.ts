@@ -11,9 +11,19 @@ import {
   type YAMLMap,
   type YAMLSeq,
 } from 'yaml'
+import {
+  bundleMountDiagnosis,
+  inspectBundleMount,
+  PLUGIN_SPEC_ENV,
+  resolvePluginSpec,
+  silentSkipConsequence,
+  type BundleMountReason,
+  type BundleMountStatus,
+} from './bundle.ts'
+import type { SearxngMode } from '../index.ts'
 import { CliError } from './errors.ts'
-import { assertValidProfile, profileDir, resolveDshHome } from './environment.ts'
-import type { CommandRunner } from './process.ts'
+import { assertValidProfile, profileDir, resolveDshCommand, resolveDshHome } from './environment.ts'
+import type { CommandResult, CommandRunner } from './process.ts'
 
 const DEFAULT_PROFILE = 'web'
 const PLUGIN_NAME = 'dsh-searxng'
@@ -22,18 +32,25 @@ const MANAGED_MARKER = 'dsh-searxng managed attachment'
 
 export interface ProfileManager {
   inspect(profile: string, signal?: AbortSignal): Promise<{ installed: boolean; patchPath: string }>
-  preview(profile: string, endpoint: string, signal?: AbortSignal): Promise<ProfileAttachmentPreview>
+  preview(
+    profile: string,
+    endpoint: string,
+    signal?: AbortSignal,
+    mode?: SearxngMode,
+  ): Promise<ProfileAttachmentPreview>
   validate(
     profile: string,
     endpoint: string,
     callback: (config: ProfileAttachmentConfig) => Promise<void>,
     signal?: AbortSignal,
+    mode?: SearxngMode,
   ): Promise<void>
   attach(
     profile: string,
     endpoint: string,
     validate: (config: ProfileAttachmentConfig) => Promise<void>,
     signal?: AbortSignal,
+    mode?: SearxngMode,
   ): Promise<void>
   detach(profile: string, signal?: AbortSignal): Promise<void>
   uninstall(profile: string, signal?: AbortSignal): Promise<void>
@@ -41,6 +58,14 @@ export interface ProfileManager {
 
 export interface ProfileAttachmentConfig {
   baseURL: string
+  /**
+   * Which deployment shape the profile describes. Written explicitly so the
+   * profile is self-describing rather than relying on the plugin schema's
+   * default, and so `doctor`/`remove` can act on the recorded intent.
+   */
+  mode?: SearxngMode
+  /** Failover pool. Preserved verbatim: the CLI never reorders or clears it. */
+  baseURLs?: string[]
   language?: string
   engines?: string
   categories?: string
@@ -53,6 +78,12 @@ export interface ProfileAttachmentPreview {
   config: ProfileAttachmentConfig
   /** Effective config of the currently recorded target patch, when one is readable. */
   current?: ProfileAttachmentConfig
+  /**
+   * Whether the plugin's bundle layer actually inserts the target entry, so the
+   * profile's config row resolves instead of being silently skipped. Absent
+   * when the profile could not be inspected far enough to decide.
+   */
+  mount?: BundleMountStatus
 }
 
 export interface ProfileFileSystem {
@@ -73,6 +104,12 @@ export interface NodeProfileManagerOptions {
   randomId?: () => string
   platform?: NodeJS.Platform
   dshCommand?: string
+  /**
+   * Package spec `setup` installs when the plugin is absent. Defaults to this
+   * package pinned to its own installed version; `DSH_SEARXNG_PLUGIN_SPEC`
+   * overrides it verbatim, and a caller may inject one directly (tests do).
+   */
+  pluginSpec?: string
 }
 
 const nodeFileSystem: ProfileFileSystem = {
@@ -153,6 +190,67 @@ function concurrentProfileModification(): CliError {
     'E_PROFILE_CONCURRENT_MODIFICATION',
     'The DSH profile changed during validation',
     'Review the profile change and retry setup',
+  )
+}
+
+/**
+ * The profile is installed and configured, but its bundle layer does not
+ * actually mount the provider: the config row resolves to nothing and a
+ * configured `web.searchProvider: searxng` fails at search time. This is a
+ * distinct, actionable state, so it gets its own code instead of a generic
+ * `E_PROFILE_WRITE`. It is raised before the patch file is touched, so the
+ * rollback path must report it verbatim rather than folding it into a write
+ * failure — hence a dedicated class.
+ */
+class BundleMountError extends CliError {
+  constructor(reason: BundleMountReason, pluginName = PLUGIN_NAME) {
+    const { message, action } = bundleMountDiagnosis(reason, pluginName)
+    super(
+      'E_PROFILE_BUNDLE_MISSING',
+      `${message}; ${silentSkipConsequence()}`,
+      action,
+      { bundleMount: reason, plugin: pluginName },
+    )
+    this.name = 'BundleMountError'
+  }
+}
+
+/**
+ * Classify a failed `dsh plugin add`.
+ *
+ * A bare "install failed" hides the one thing the operator can fix. The plugin
+ * manager refuses a package whose declared harness requirements the running DSH
+ * does not satisfy, and its diagnostic names the offending package and version.
+ * That case is separately actionable — the spec resolved to an incompatible
+ * release, usually because the registry serves an older `latest` than the one
+ * asked for — so it gets `E_PLUGIN_INSTALL_FAILED` with the registry remedy.
+ * Every other failure stays a plain install failure so the rollback path keeps
+ * classifying it as a process error.
+ * @param result - the completed command result.
+ * @param spec - the spec that was requested, for the message.
+ * @returns the failure to report.
+ */
+function installRejected(result: CommandResult, spec: string): Error {
+  const output = `${result.stdout}\n${result.stderr}`
+  const incompatible = /is incompatible with dsh/i.test(output)
+  if (!incompatible) return new OperationFailure('install')
+  // Quote the manager's own rejection lines: they name the exact requirement
+  // that failed, which is more precise than anything this CLI could paraphrase.
+  // The requirement object sits on the line AFTER the "incompatible" sentence,
+  // so matching only the keywords would drop the detail that matters most.
+  const lines = output.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+  const start = lines.findIndex((line) => /is incompatible with dsh/i.test(line))
+  const detail = (start === -1
+    ? lines.filter((line) => /installation rejected|nothing was installed/i.test(line))
+    : lines.slice(start, start + 2))
+    .map((line) => line.replace(/^dsh:\s*/, ''))
+    .join(' ')
+    .trim()
+  return new CliError(
+    'E_PLUGIN_INSTALL_FAILED',
+    `dsh plugin add ${spec} was refused because that package is incompatible with this dsh runtime${detail.length === 0 ? '' : `: ${detail}`}`,
+    `Install a dsh-searxng release compatible with this dsh runtime, or set ${PLUGIN_SPEC_ENV} to an explicit spec (a version, dist-tag, git URL, or packed tarball path)`,
+    { spec, incompatible: true },
   )
 }
 
@@ -260,6 +358,45 @@ function installedFromManifest(value: unknown): boolean {
   return dependencyInstalled || bundleInstalled
 }
 
+/**
+ * The profile manifest's current `dsh.profile.bundles` list.
+ * @param value - the parsed manifest.
+ * @returns the bundle names; empty when the field is absent.
+ * @throws when the field exists but is not a list of strings.
+ */
+function bundlesFromManifest(value: unknown): string[] {
+  if (!isPlainRecord(value)) throw profileWriteError('The DSH profile manifest is invalid')
+  if (value.dsh === undefined) return []
+  if (!isPlainRecord(value.dsh)) throw profileWriteError('The DSH profile manifest is invalid')
+  if (value.dsh.profile === undefined) return []
+  if (!isPlainRecord(value.dsh.profile)) throw profileWriteError('The DSH profile manifest is invalid')
+  const bundles = value.dsh.profile.bundles
+  if (bundles === undefined) return []
+  if (!Array.isArray(bundles) || bundles.some((item) => typeof item !== 'string')) {
+    throw profileWriteError('The DSH profile manifest is invalid')
+  }
+  return [...bundles]
+}
+
+/**
+ * Append `name` to a manifest's `dsh.profile.bundles`, preserving every other
+ * field verbatim. Returns the manifest unchanged when the name is already
+ * enrolled, so a repeat run is a no-op.
+ * @param value - the parsed manifest.
+ * @param name - the bundle to enroll.
+ * @returns the updated manifest, or undefined when no change is needed.
+ */
+function withEnrolledBundle(value: unknown, name: string): Record<string, unknown> | undefined {
+  const bundles = bundlesFromManifest(value)
+  if (bundles.includes(name)) return undefined
+  if (!isPlainRecord(value)) throw profileWriteError('The DSH profile manifest is invalid')
+  const dsh = value.dsh === undefined ? {} : value.dsh
+  if (!isPlainRecord(dsh)) throw profileWriteError('The DSH profile manifest is invalid')
+  const profile = dsh.profile === undefined ? {} : dsh.profile
+  if (!isPlainRecord(profile)) throw profileWriteError('The DSH profile manifest is invalid')
+  return { ...value, dsh: { ...dsh, profile: { ...profile, bundles: [...bundles, name] } } }
+}
+
 function hasManagedMarker(node: YAMLMap<unknown, unknown>): boolean {
   return (node.commentBefore ?? '')
     .split('\n')
@@ -318,6 +455,24 @@ function providerConfig(config: YAMLMap<unknown, unknown>, endpoint?: string): P
   const configuredBaseURL = endpoint ?? value.baseURL
   if (typeof configuredBaseURL !== 'string') throw profileWriteError('The target DSH profile config has no valid SearXNG endpoint')
   const result: ProfileAttachmentConfig = { baseURL: normalizeEndpoint(configuredBaseURL) }
+  // `mode` is read back so a caller can report the recorded intent. A value the
+  // plugin schema would reject is treated as a malformed profile rather than
+  // silently coerced to a default, because the two modes have opposite
+  // consequences for whether Docker may be touched.
+  const mode = value.mode
+  if (mode !== undefined) {
+    if (mode !== 'external' && mode !== 'managed') {
+      throw profileWriteError('The target DSH profile mode config is invalid')
+    }
+    result.mode = mode
+  }
+  const baseURLs = value.baseURLs
+  if (baseURLs !== undefined) {
+    if (!Array.isArray(baseURLs) || baseURLs.some((entry) => typeof entry !== 'string')) {
+      throw profileWriteError('The target DSH profile baseURLs config is invalid')
+    }
+    result.baseURLs = [...baseURLs] as string[]
+  }
   for (const key of ['language', 'engines', 'categories', 'authHeader'] as const) {
     const field = value[key]
     if (field === undefined) continue
@@ -344,11 +499,19 @@ function configFromAttachment(bytes: Buffer): ProfileAttachmentConfig {
   return providerConfig(configOf(parsed.document, target))
 }
 
-function isCurrentManagedAttachment(parsed: ParsedPatch, endpoint: string): boolean {
+function isCurrentManagedAttachment(
+  parsed: ParsedPatch,
+  endpoint: string,
+  mode: SearxngMode,
+): boolean {
   const managed = parsed.sequence.items.filter(isManagedPatch)
   const target = lastTarget(parsed)
   if (managed.length !== 1 || target === undefined || !isManagedPatch(target)) return false
-  return providerConfig(configOf(parsed.document, target)).baseURL === endpoint
+  const config = providerConfig(configOf(parsed.document, target))
+  // The mode is part of the attachment's identity: a profile that targets the
+  // right endpoint but records the wrong shape would send `doctor` and
+  // `remove --service` down the wrong branch, so it reads as not attached.
+  return config.baseURL === endpoint && (config.mode ?? 'external') === mode
 }
 
 function serializePatch(document: Document<Node, true>): Buffer {
@@ -363,7 +526,11 @@ function serializePatch(document: Document<Node, true>): Buffer {
   }
 }
 
-function renderAttachment(parsed: ParsedPatch, endpoint: string): Buffer {
+function renderAttachment(
+  parsed: ParsedPatch,
+  endpoint: string,
+  mode: SearxngMode,
+): Buffer {
   const { document, sequence } = parsed
   let lastEffectiveConfig: YAMLMap<unknown, unknown> | undefined
   const retained: Node[] = []
@@ -381,11 +548,24 @@ function renderAttachment(parsed: ParsedPatch, endpoint: string): Buffer {
 
   const config = lastEffectiveConfig ?? document.createNode({}) as YAMLMap<unknown, unknown>
   config.set('baseURL', endpoint)
+  // Written explicitly rather than left to the schema default: the profile
+  // records which shape the operator chose, so `doctor`, `remove --service` and
+  // the settings page all read the same intent instead of inferring it. Every
+  // other key (notably a `baseURLs` failover pool) is carried through untouched.
+  config.set('mode', mode)
   const managed = document.createNode({ id: TARGET_ID }) as YAMLMap<unknown, unknown>
   if (!isMap(managed)) throw profileWriteError()
   managed.set('config', config)
   managed.commentBefore = ` ${MANAGED_MARKER}`
   sequence.items = [...retained, managed]
+  // Force block style. A profile initialized from the shipped template starts
+  // as the flow sequence `[]`, and appending to a flow sequence makes the whole
+  // document serialize as `[{ id: ..., config: { ... } }]` — valid YAML, but
+  // nothing like the block shape every DSH profile and the shipped template
+  // use, and unreadable once a config carries more than a couple of keys. The
+  // entry list is the one place the CLI must match the harness's own shape.
+  sequence.flow = false
+  if (isMap(config)) config.flow = false
   return serializePatch(document)
 }
 
@@ -408,6 +588,7 @@ export class NodeProfileManager implements ProfileManager {
   private readonly randomId: () => string
   private readonly platform: NodeJS.Platform
   private readonly dshCommand: string
+  private readonly pluginSpec: string
 
   constructor(options: NodeProfileManagerOptions) {
     this.commandRunner = options.commandRunner
@@ -417,7 +598,13 @@ export class NodeProfileManager implements ProfileManager {
     this.fileSystem = options.fileSystem ?? nodeFileSystem
     this.randomId = options.randomId ?? (() => `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`)
     this.platform = options.platform ?? process.platform
-    this.dshCommand = options.dshCommand ?? 'dsh'
+    // Honour DSH_SEARXNG_DSH_BIN directly too: a caller that constructs this
+    // manager without threading an env (the CLI does thread it) must still get
+    // the override, because a Desktop-only install has no dsh on PATH.
+    this.dshCommand = options.dshCommand ?? resolveDshCommand()
+    // Same rationale for the install spec: pinning to this package's own version
+    // must not depend on the caller remembering to pass it.
+    this.pluginSpec = options.pluginSpec ?? resolvePluginSpec()
   }
 
   async inspect(profile: string, signal?: AbortSignal): Promise<{ installed: boolean; patchPath: string }> {
@@ -430,7 +617,12 @@ export class NodeProfileManager implements ProfileManager {
     return { installed, patchPath }
   }
 
-  async preview(profile: string, endpoint: string, signal?: AbortSignal): Promise<ProfileAttachmentPreview> {
+  async preview(
+    profile: string,
+    endpoint: string,
+    signal?: AbortSignal,
+    mode: SearxngMode = 'external',
+  ): Promise<ProfileAttachmentPreview> {
     signal?.throwIfAborted()
     const name = resolvedProfileName(profile)
     const normalizedEndpoint = normalizeEndpoint(endpoint)
@@ -439,16 +631,18 @@ export class NodeProfileManager implements ProfileManager {
     const snapshot = await this.readPatchSnapshot(join(dir, 'cordis.patch.yml'))
     const source = snapshot.bytes ?? Buffer.from('[]\n')
     const current = parsePatch(source)
-    const attached = installed && isCurrentManagedAttachment(current, normalizedEndpoint)
-    const output = renderAttachment(parsePatch(source), normalizedEndpoint)
+    const attached = installed && isCurrentManagedAttachment(current, normalizedEndpoint, mode)
+    const output = renderAttachment(parsePatch(source), normalizedEndpoint, mode)
     let currentConfig: ProfileAttachmentConfig | undefined
     try { currentConfig = cloneProviderConfig(configFromAttachment(source)) } catch { currentConfig = undefined }
+    const mount = await this.readBundleMount(dir)
     signal?.throwIfAborted()
     return {
       installed,
       attached,
       config: cloneProviderConfig(configFromAttachment(output)),
       ...(currentConfig === undefined ? {} : { current: currentConfig }),
+      ...(mount === undefined ? {} : { mount }),
     }
   }
 
@@ -457,6 +651,7 @@ export class NodeProfileManager implements ProfileManager {
     endpoint: string,
     callback: (config: ProfileAttachmentConfig) => Promise<void>,
     signal?: AbortSignal,
+    mode: SearxngMode = 'external',
   ): Promise<void> {
     signal?.throwIfAborted()
     const name = resolvedProfileName(profile)
@@ -478,7 +673,7 @@ export class NodeProfileManager implements ProfileManager {
       snapshot.bytes === undefined
     ) throw concurrentProfileModification()
     const parsed = parsePatch(snapshot.bytes)
-    if (!isCurrentManagedAttachment(parsed, normalizedEndpoint)) throw concurrentProfileModification()
+    if (!isCurrentManagedAttachment(parsed, normalizedEndpoint, mode)) throw concurrentProfileModification()
     const target = lastTarget(parsed)
     if (target === undefined) throw concurrentProfileModification()
     const config = cloneProviderConfig(providerConfig(configOf(parsed.document, target)))
@@ -513,6 +708,7 @@ export class NodeProfileManager implements ProfileManager {
     endpoint: string,
     validate: (config: ProfileAttachmentConfig) => Promise<void>,
     signal?: AbortSignal,
+    mode: SearxngMode = 'external',
   ): Promise<void> {
     signal?.throwIfAborted()
     const name = resolvedProfileName(profile)
@@ -542,7 +738,7 @@ export class NodeProfileManager implements ProfileManager {
       throw error
     }
     if (original.bytes !== undefined) {
-      renderAttachment(parsePatch(original.bytes), normalizedEndpoint)
+      renderAttachment(parsePatch(original.bytes), normalizedEndpoint, mode)
     }
     let pluginAdded = false
     let pluginResidualPossible = false
@@ -587,6 +783,21 @@ export class NodeProfileManager implements ProfileManager {
         deferredAddError = addError
       }
 
+      // Enrol the bundle layer BEFORE writing the config row. The row is a
+      // non-insert patch: the loader resolves it by id against entries that
+      // already exist, and the only thing that creates this entry is the
+      // plugin's own bundle layer, applied because the profile lists the
+      // package in `dsh.profile.bundles`. Without enrolment the row is dropped
+      // with a loader warning and the provider never registers. This is the
+      // state a real profile was found in, so it is repaired and then proved,
+      // never assumed: `dsh plugin add` normally enrols the bundle itself, but
+      // a hand-edited manifest can remove it and nothing fails until a search.
+      const enrolled = await this.ensureBundleEnrolled(packagePath, manifestBaseline, signal)
+      if (enrolled !== undefined) {
+        manifestBaseline = enrolled
+      }
+      await this.requireBundleMount(dir, packagePath, manifestBaseline)
+
       signal?.throwIfAborted()
       const renderBase = await this.readPatchSnapshot(patchPath)
       if (!await this.manifestMatches(packagePath, manifestBaseline)) {
@@ -602,7 +813,7 @@ export class NodeProfileManager implements ProfileManager {
       }
       if (deferredAddError !== undefined) throw deferredAddError
       failureStage = 'write'
-      output = renderAttachment(parsePatch(renderBase.bytes ?? Buffer.from('[]\n')), normalizedEndpoint)
+      output = renderAttachment(parsePatch(renderBase.bytes ?? Buffer.from('[]\n')), normalizedEndpoint, mode)
       // Portable best-effort CAS: within the trusted profile directory, compare
       // bytes plus file identity immediately before the atomic rename.
       const beforeCommit = await this.readPatchSnapshot(patchPath)
@@ -680,6 +891,17 @@ export class NodeProfileManager implements ProfileManager {
         const cancellation = cancellationFrom(effectivePrimaryError, signal)
         if (cancellation !== undefined) throw cancellation
         if (effectivePrimaryError instanceof CliError) throw effectivePrimaryError
+      }
+      // A bundle-mount failure is raised before the patch file is touched and
+      // names its own repair; folding it into a generic write failure would
+      // hide the one fact the operator needs. Residual state is still reported.
+      if (effectivePrimaryError instanceof BundleMountError) {
+        throw new CliError(
+          'E_PROFILE_BUNDLE_MISSING',
+          effectivePrimaryError.message,
+          effectivePrimaryError.action,
+          { ...effectivePrimaryError.details, rollbackFailures },
+        )
       }
       throw profileWriteError(
         'Unable to attach SearXNG to the DSH profile',
@@ -795,6 +1017,86 @@ export class NodeProfileManager implements ProfileManager {
     }
   }
 
+  /**
+   * Observe whether the plugin's bundle layer really inserts the target entry
+   * for this profile. Returns undefined when the manifest cannot be read far
+   * enough to decide, so callers never mistake "unknown" for "broken".
+   * @param dir - absolute profile directory.
+   * @returns the mount verdict, or undefined when undecidable.
+   */
+  private async readBundleMount(dir: string): Promise<BundleMountStatus | undefined> {
+    let bundles: string[]
+    try {
+      const snapshot = await this.readManifestSnapshot(join(dir, 'package.json'))
+      if (snapshot.bytes === undefined) return undefined
+      bundles = bundlesFromManifest(JSON.parse(snapshot.bytes.toString()))
+    } catch {
+      return undefined
+    }
+    try {
+      return await inspectBundleMount({ profileDir: dir, pluginName: PLUGIN_NAME, targetId: TARGET_ID, bundles })
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Enrol the plugin package as a profile bundle when it is not already listed,
+   * preserving every other manifest field. A no-op for the normal case, where
+   * `dsh plugin add` already reconciled the bundle list.
+   * @param packagePath - absolute profile manifest path.
+   * @param expected - the manifest snapshot the caller is working against.
+   * @param signal - cancellation signal.
+   * @returns the new manifest snapshot when the file was rewritten, else undefined.
+   * @throws {@link concurrentProfileModification} when the manifest moved under us.
+   */
+  private async ensureBundleEnrolled(
+    packagePath: string,
+    expected: PatchSnapshot,
+    signal?: AbortSignal,
+  ): Promise<PatchSnapshot | undefined> {
+    signal?.throwIfAborted()
+    const current = await this.readManifestSnapshot(packagePath)
+    if (!sameSnapshot(current, expected) || current.bytes === undefined) throw concurrentProfileModification()
+    let parsed: unknown
+    try { parsed = JSON.parse(current.bytes.toString()) } catch { throw profileWriteError('The DSH profile manifest is invalid') }
+    const updated = withEnrolledBundle(parsed, PLUGIN_NAME)
+    if (updated === undefined) return undefined
+    // Serialize exactly like the manifest the CLI already read: two-space JSON
+    // plus a trailing newline, the shape `initProfile` and `saveManifest` write.
+    const bytes = Buffer.from(`${JSON.stringify(updated, undefined, 2)}\n`)
+    const committed = await this.writeAtomic(packagePath, bytes, current)
+    signal?.throwIfAborted()
+    return committed
+  }
+
+  /**
+   * Prove the config row this CLI is about to write will actually resolve.
+   * A row that the loader silently skips is worse than a failed setup: it looks
+   * configured while `ctx.web` has no provider, and the operator only finds out
+   * when a search throws `WEB_PROVIDER_CONFIGURED_MISSING`.
+   *
+   * The guard fires only on conditions it can prove: the package is enrolled
+   * and installed, so its bundle layer is readable, and that layer still does
+   * not insert the entry. An uninstallable package is not a mount problem —
+   * `attach` reports that separately and more precisely — so it is left to the
+   * normal install failure path rather than blamed on bundle composition.
+   * @param dir - absolute profile directory.
+   * @param packagePath - absolute profile manifest path.
+   * @param expected - the manifest snapshot the caller is working against.
+   * @throws {@link BundleMountError} when the entry provably does not compose.
+   */
+  private async requireBundleMount(
+    dir: string,
+    packagePath: string,
+    expected: PatchSnapshot,
+  ): Promise<void> {
+    if (!await this.manifestMatches(packagePath, expected)) throw concurrentProfileModification()
+    const mount = await this.readBundleMount(dir)
+    if (mount === undefined || mount.composes || !mount.observable) return
+    throw new BundleMountError(mount.reason ?? 'not-enrolled')
+  }
+
   private installedFromManifestSnapshot(snapshot: PatchSnapshot): boolean {
     if (snapshot.bytes === undefined) return false
     let value: unknown
@@ -864,11 +1166,17 @@ export class NodeProfileManager implements ProfileManager {
     signal?: AbortSignal,
   ): Promise<void> {
     signal?.throwIfAborted()
+    // Pinned spec, not the bare registry name: `dsh plugin add dsh-searxng`
+    // resolves to whatever the registry serves as `latest`, so a release that is
+    // newer than the registry would install an older version that the plugin
+    // manager then rejects as incompatible — `npx dsh-searxng@0.5.0 setup` could
+    // not install itself. Pinning (or an explicit DSH_SEARXNG_PLUGIN_SPEC) makes
+    // a self-install and a pre-release/`@next` install deterministic.
     const result = await this.commandRunner.run(this.dshCommand, [
-      'plugin', '--profile', profile, 'add', PLUGIN_NAME,
+      'plugin', '--profile', profile, 'add', this.pluginSpec,
     ], { signal })
     signal?.throwIfAborted()
-    if (result.exitCode !== 0) throw new OperationFailure('install')
+    if (result.exitCode !== 0) throw installRejected(result, this.pluginSpec)
   }
 
   private async restoreSnapshot(

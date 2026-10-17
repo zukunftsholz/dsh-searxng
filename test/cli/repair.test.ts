@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { symlinkTestTitle, symlinkUnsupported } from './symlink-capability.ts'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -467,7 +468,9 @@ describe('executeRepair', () => {
     const result = await executeRepair(plan, test.dependencies)
 
     expect(result.actions).toEqual([{ type: 'reattach-profile', profile: 'web', endpoint: EXTERNAL_ENDPOINT }])
-    expect(test.profiles.attach).toHaveBeenCalledWith('web', EXTERNAL_ENDPOINT, expect.any(Function), undefined)
+    // Repair restores the recorded shape: an external profile is reattached as
+    // external, so the mode never silently flips to managed.
+    expect(test.profiles.attach).toHaveBeenCalledWith('web', EXTERNAL_ENDPOINT, expect.any(Function), undefined, 'external')
     expect(test.docker.preflight).not.toHaveBeenCalled()
     expect(test.docker.deploymentStatus).not.toHaveBeenCalled()
     expect(test.writes).toEqual([externalState()])
@@ -595,7 +598,8 @@ describe('executeRepair', () => {
     }
   })
 
-  it('refuses to remove a staging entry that is not a safe directory', async () => {
+  // Gated on a MEASURED capability, not `process.platform`. See symlink-capability.ts.
+  it.skipIf(symlinkUnsupported)(symlinkTestTitle('refuses to remove a staging entry that is not a safe directory'), async () => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-searxng-staging-'))
     try {
       const staging = '.staging-4242-0123456789abcdef'

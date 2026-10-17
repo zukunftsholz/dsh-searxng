@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { symlinkTestTitle, symlinkUnsupported } from './symlink-capability.ts'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -960,7 +961,7 @@ describe('setup respects an interrupted journal', () => {
   it('refuses to run and directs to repair without mutating anything', async () => {
     await withWorld({ phase: 'mutating', state: managedState(), running: 'target' }, async (materialized, graph) => {
       const error = await setup(
-        { profile: 'web', port: 8080, portExplicit: true },
+        { profile: 'web', mode: 'managed', port: 8080, portExplicit: true },
         {
           environment: graph.environment,
           state: graph.dependencies.state,
@@ -1123,7 +1124,7 @@ describe('non-update journal escape path', () => {
 
       // Step 3: setup succeeds over the same world — no journal, no dead-loop.
       const setupResult = await setup(
-        { profile: 'web', port: 8080, portExplicit: true },
+        { profile: 'web', mode: 'managed', port: 8080, portExplicit: true },
         {
           environment,
           state: new FileStateStore(managedDir, HOME_ID),
@@ -1149,7 +1150,7 @@ describe('non-update journal escape path', () => {
           now: () => new Date(RECOVERY_TIME),
         },
       )
-      expect(setupResult).toEqual({ profile: 'web', endpoint: ENDPOINT, reused: false })
+      expect(setupResult).toEqual({ profile: 'web', endpoint: ENDPOINT, reused: false, mode: 'managed' })
       const recreated: StateV2 = JSON.parse(await readFile(join(managedDir, 'state.json'), 'utf8'))
       expect(recreated.managed?.current).toMatchObject({ port: 8080, endpoint: ENDPOINT })
       await expect(stat(join(managedDir, 'journal.json'))).rejects.toMatchObject({ code: 'ENOENT' })
@@ -1222,7 +1223,8 @@ describe('orphaned staging directories', () => {
     })
   })
 
-  it('refuses to remove a staging entry that is a symlink', async () => {
+  // Gated on a MEASURED capability, not `process.platform`. See symlink-capability.ts.
+  it.skipIf(symlinkUnsupported)(symlinkTestTitle('refuses to remove a staging entry that is a symlink'), async () => {
     const staging = '.staging-4242-0123456789abcdef'
     await withWorld({ phase: 'prepared', state: managedState() }, async (materialized, graph) => {
       await rm(join(materialized.root, 'journal.json'), { force: true })

@@ -1,6 +1,12 @@
 import type { SearxngResult, SearxngSearchResponse } from './types.ts'
 
-const USER_AGENT = 'dsh-searxng/0.4.0'
+/**
+ * Attribution header sent on every request. Kept in lockstep with the package
+ * major/minor: it is how an operator reading instance logs attributes traffic
+ * to this plugin, so a stale value misreports the caller. Bump with the package
+ * version (see package.json `version`).
+ */
+const USER_AGENT = 'dsh-searxng/0.5.0'
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000
 const DEFAULT_RETRY_DELAY_MS = 100
 const RETRYABLE_STATUSES = new Set([502, 503, 504])
@@ -14,6 +20,13 @@ export type SearxngClientFailureKind =
   | 'http'
   | 'busy'
   | 'budget'
+  /**
+   * A resolved options snapshot that cannot drive a request (a knob that is not
+   * a non-negative/positive safe integer, or a malformed failover pool). The
+   * plugin config is validated when the plugin mounts, but under volatile
+   * settings a later edit can reach the provider without a remount.
+   */
+  | 'config'
 
 export class SearxngClientError extends Error {
   constructor(

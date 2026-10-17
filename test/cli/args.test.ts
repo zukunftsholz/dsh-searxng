@@ -9,10 +9,50 @@ describe('parseCliArgs', () => {
   it('rejects help combined with mutations', () => {
     expect(() => parseCliArgs(['setup', '--help'])).toThrow(/cannot be combined/i)
   })
-  it('defaults setup to the web profile and port 8080', () => {
-    expect(parseCliArgs(['setup'])).toEqual({
+  it('requires an explicit deployment mode instead of defaulting to provisioning', () => {
+    // The user directive behind this rule: setup must never deploy SearXNG by
+    // itself unless asked. Both the omission and the ambiguity are refused
+    // before any profile or Docker work can happen.
+    expect(() => parseCliArgs(['setup'])).toThrow(/--url <endpoint>|--managed/i)
+    expect(() => parseCliArgs(['setup', '--profile', 'work'])).toThrow(/--url <endpoint>|--managed/i)
+    expect(() => parseCliArgs(['setup', '--url', 'https://search.example', '--managed']))
+      .toThrow(/different modes/i)
+  })
+
+  it('gives each mode argument failure its own actionable code', () => {
+    // A generic E_USAGE would bury the one decision the operator must make.
+    expect(() => parseCliArgs(['setup'])).toThrow(
+      expect.objectContaining({ code: 'E_MODE_REQUIRED' }),
+    )
+    expect(() => parseCliArgs(['setup', '--managed', '--url', 'https://search.example'])).toThrow(
+      expect.objectContaining({ code: 'E_MODE_MISMATCH' }),
+    )
+    // Every other argument failure stays a plain usage error.
+    expect(() => parseCliArgs(['setup', '--managed', '--port', '0'])).toThrow(
+      expect.objectContaining({ code: 'E_USAGE' }),
+    )
+    expect(() => parseCliArgs(['status', '--managed'])).toThrow(
+      expect.objectContaining({ code: 'E_USAGE' }),
+    )
+  })
+
+  it('defaults the profile and port, and records the external mode for --url', () => {
+    expect(parseCliArgs(['setup', '--url', 'https://search.example'])).toEqual({
       command: 'setup',
       profile: 'web',
+      mode: 'external',
+      url: 'https://search.example',
+      port: 8080,
+      portExplicit: false,
+      json: false,
+    })
+  })
+
+  it('records the managed mode for --managed without an endpoint', () => {
+    expect(parseCliArgs(['setup', '--managed'])).toEqual({
+      command: 'setup',
+      profile: 'web',
+      mode: 'managed',
       port: 8080,
       portExplicit: false,
       json: false,
@@ -23,6 +63,7 @@ describe('parseCliArgs', () => {
     expect(parseCliArgs(['setup', '--profile', 'work', '--url', 'https://search.example', '--port', '9090', '--json'])).toEqual({
       command: 'setup',
       profile: 'work',
+      mode: 'external',
       url: 'https://search.example',
       port: 9090,
       portExplicit: true,
@@ -33,12 +74,14 @@ describe('parseCliArgs', () => {
   it('accepts an absolute HTTP(S) URL with a subpath', () => {
     expect(parseCliArgs(['setup', '--url', 'https://search.example/searxng'])).toMatchObject({
       command: 'setup',
+      mode: 'external',
       url: 'https://search.example/searxng',
     })
   })
 
   it.each([1, 65535])('accepts setup port boundary %s', (port) => {
-    expect(parseCliArgs(['setup', '--port', String(port)])).toMatchObject({ command: 'setup', port, portExplicit: true })
+    expect(parseCliArgs(['setup', '--managed', '--port', String(port)]))
+      .toMatchObject({ command: 'setup', mode: 'managed', port, portExplicit: true })
   })
 
   it.each(['status', 'doctor', 'tune'])('parses %s with defaults', (command) => {
@@ -142,6 +185,12 @@ describe('parseCliArgs', () => {
     ['update port', ['update', '--port', '8081']],
     ['update url', ['update', '--url', 'https://search.example']],
     ['update service', ['update', '--service']],
+    // The DSH launcher rejects `node_modules` as a profile name; accepting it
+    // here would create a directory under profiles/ that shadows dependency
+    // resolution and that `dsh --profile node_modules` refuses to boot.
+    ['setup node_modules profile', ['setup', '--profile', 'node_modules']],
+    ['status node_modules profile', ['status', '--profile', 'node_modules']],
+    ['doctor parent profile', ['doctor', '--profile', '..']],
   ] as const)('rejects %s', (_name, argv) => {
     expect(() => parseCliArgs(argv)).toThrow()
   })

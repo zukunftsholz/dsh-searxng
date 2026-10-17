@@ -1,7 +1,8 @@
 # Development Plan — Deepening the Owned-Stack Advantage
 
-Status: proposed, revision 3. M1/M2 are the near-term scope; M3/M4 are conditional on
-measured benefit. Version labels are planning targets, not release commitments.
+Status: proposed, revision 4. M1/M2 shipped in `0.4.0`; the DeepSeek Harness `0.2.1-rc.2` port
+shipped as `0.5.0`; M3/M4 are conditional on measured benefit. Version labels are planning
+targets, not release commitments.
 
 ## Strategy
 
@@ -92,16 +93,22 @@ transactions merely to complete the version sequence. No comparative results are
 
 | Asset | Where | Notes |
 |---|---|---|
-| Web seam adapter | `src/provider.ts` | Thin; maps client errors to `WebError`. |
-| HTTP client | `src/searxng-client.ts` | Dependency-free; 2-attempt retry on 502/503/504 + network/timeout; no 429 handling, no pacing, no cache. |
-| Plugin config | `src/index.ts` | `baseURL`, `language`, `engines`, `categories`, `authHeader` — all static, profile-level. |
-| Deployment catalog | `assets/deployments/v1.json`, `src/cli/deployments.ts` | Schema 1; one entry; `selectDeployment` supports multi-entry catalogs, but `setup` still hardcodes version 1 (`src/cli/setup.ts:137`). |
+| Web seam adapter | `src/provider.ts` | Takes an options RESOLVER, snapshotted once per operation; maps client errors to `WebError` with a redacted `cause`. Applies `maxResults` at its own request layer. |
+| HTTP client | `src/searxng-client.ts` | Dependency-free request primitives: 2-attempt retry on 502/503/504 + network/timeout. Cache, pacing, 429 `Retry-After`, and the total budget live in the provider-owned session. |
+| Provider session | `src/search-session.ts` | Per-provider-instance cache (TTL + LRU), per-endpoint token bucket with a bounded queue, health-decay failover pool, and one `totalBudgetMs` deadline spanning pacing, backoff, and every attempt. |
+| Plugin config | `src/index.ts` | `mode` (closed union, default `external`) plus `baseURL`, `baseURLs`, `language`, `engines`, `categories`, `authHeader`, and the four tuning knobs — every field `.volatile()`, read through `.get()` at operation time. |
+| Deployment catalog | `assets/deployments/v1.json`, `src/cli/deployments.ts` | Schema 1; one entry; `setup` selects through `selectDeployment(catalog, stateSchema)`, and `update` moves between versions. |
 | Bundle publishing | `src/cli/assets.ts` | Content-addressed, immutable bundle directories (`configurationHash` names the directory; `.env` points `DSH_SEARXNG_SETTINGS_DIR` at it). `stage()` is the transactional publish path used by `update`. |
+| Bundle mount guard | `src/cli/bundle.ts` | Observes whether the profile's `dsh.profile.bundles` enrolment plus the plugin's bundle layer actually insert `web-search-searxng`; `attach` proves composition before writing the config row, and `doctor` reports it as its own check. |
 | Journal | `src/cli/journal.ts` | Kinds `setup/repair/update/remove`; `target` carries only `deploymentVersion/image`; recovery recommendations are phase-based. Schema 1, strict keys. |
-| Lifecycle commands | `src/cli/{setup,status,doctor,repair,update,remove}.ts` | Journaling, transactional update with rollback, ownership labels; `repair` actions include `restart-container` and `recreate-runtime`. |
+| Lifecycle commands | `src/cli/{setup,status,doctor,repair,update,remove}.ts` | Journaling, transactional update with rollback, ownership labels; `repair` actions include `restart-container` and `recreate-runtime`. `setup` requires an explicit `--url` or `--managed` mode. |
 | State | `src/cli/state.ts` | Schema-versioned (1, 2 in catalog) with migration hooks. |
 | Validation | `src/cli/searxng.ts` | Real-search readiness/probe pipeline reused by setup/update/repair. |
 | Tests | `test/cli/*.test.ts`, `test/e2e/managed-setup.test.ts`, opt-in docker integration | Per-module unit tests; `pnpm verify` gate. |
+
+Milestone numbering below is planning history: M1 and M2 shipped in `0.4.0`. The port
+to DeepSeek Harness `0.2.1-rc.2` shipped as `0.5.0` and changed the harness support line,
+not the milestone plan.
 
 ## Non-goals
 
@@ -119,6 +126,30 @@ transactions merely to complete the version sequence. No comparative results are
 - **No Podman**, no seam-shape changes, no new peer dependencies.
 
 ## Milestones
+
+### 0.5.0 (shipped) — DeepSeek Harness 0.2.1-rc.2 port
+
+Not a milestone in the M-series below; a compatibility port with one behaviour change the
+product needed.
+
+- Harness line `>=0.2.1-rc.2 <0.3.0` for `@deepseek-ai/dsh-web` and
+  `@deepseek-ai/dsh-launch-environment`, `@deepseek-ai/cordis ^4.0.5`,
+  `@deepseek-ai/schemastery ~3.18.5`. The `0.1.x` line is no longer supported.
+- Every plugin config field is `.volatile()` and read at operation time, so a settings edit
+  applies to the next search without a remount. The provider and its session take an options
+  resolver instead of a frozen options object.
+- `mode` (`external` | `managed`, default `external`) is a selectable, validated settings field
+  and a required CLI decision: `setup --url <endpoint>` or `setup --managed`.
+- `maxResults` is applied inside the provider, leaving `truncated: false`.
+- The CLI enrols the package in `dsh.profile.bundles` and proves the bundle layer inserts
+  `web-search-searxng` before writing the config row (`E_PROFILE_BUNDLE_MISSING`); `doctor` gained a
+  `bundle` check.
+- `setup` installs a package spec pinned to the running version (`DSH_SEARXNG_PLUGIN_SPEC` to
+  override) and reports `E_PLUGIN_INSTALL_FAILED` when the plugin manager rejects the resolved
+  package as incompatible with the running dsh. `DSH_SEARXNG_DSH_BIN` names the `dsh` executable for
+  a Desktop-only install.
+- Files: `src/index.ts`, `src/provider.ts`, `src/search-session.ts`, `src/searxng-client.ts`,
+  `src/cli/**`, `package.json`, `README.md`, `docs/`.
 
 ### M1 (v0.4.0) — Catalog-driven setup + bounded client reliability
 
@@ -188,7 +219,11 @@ settling the proposed defaults.
 Deferred from the original draft: in-process counters. Nothing consumes them (the `stats`
 idea is unscheduled and reads SearXNG's own `/metrics`); they return when a consumer exists.
 
-### M2 (v0.5.0) — Read-only `tune` report + scoped privacy posture
+### M2 (shipped in v0.4.0) — Read-only `tune` report + scoped privacy posture
+
+The heading's original `(v0.5.0)` label never materialised: M2 shipped alongside M1 in `0.4.0`,
+and `0.5.0` became the DeepSeek Harness `0.2.1-rc.2` port instead. The M3/M4 labels below shift
+accordingly and remain conditional.
 
 Theme: the measurement and trust half of tuning, with **zero mutation surface**. The apply
 path is deliberately a separate milestone (M3) because configuration changes are
@@ -375,7 +410,9 @@ M5: unscheduled; each item needs a separate demand and scope decision
 ## Release discipline (every milestone)
 
 1. `pnpm verify` (typecheck, unit tests, build, pack, packed-CLI check) green on all three
-   platforms in CI.
+   platforms in CI. Tests that need a host privilege the runner lacks skip themselves behind a
+   measured capability probe, so a green run means no expected failures — not a known-failure
+   allowance.
 2. Opt-in docker CI legs (`DSH_SEARXNG_E2E=1`, `DSH_SEARXNG_DOCKER_INTEGRATION=1`) exercise
    the new managed surface (tune report for M2; apply/interrupt/repair and `--preset zh`
    for M3/M4).
@@ -392,7 +429,8 @@ M5: unscheduled; each item needs a separate demand and scope decision
 
 | Risk | Mitigation |
 |---|---|
-| dsh is in developer preview; breaking seam/peer changes | Keep peer windows narrow (current pattern), CI matrix, and treat seam drift as a patch release, not a milestone blocker. |
+| dsh is in developer preview; breaking seam/peer changes | Keep peer windows narrow (current pattern), CI matrix, and treat seam drift as a patch release, not a milestone blocker. The 0.1.x → 0.2.x break was handled exactly this way as `0.5.0`. |
+| A volatile settings section changes shape between searches | The schema is the gate: `mode` is a closed union and every knob is validated per operation, so a bad saved value surfaces as a typed `config` provider error instead of a crash. |
 | SearXNG JSON drift (`unresponsive_engines`, per-result `engine`) | Digest-pinned images make drift opt-in via `update`; tune parses tolerantly and degrades to watch-only. |
 | Pacing adds latency or holds callers | Validate proposed defaults (burst 2 / 1500 ms, queue cap 8); the M1 total budget (15 s default) bounds the worst-case call; queue-full rejects fast. |
 | Overlay vs. newer SearXNG settings keys | Closed overlay vocabulary (engine enable/disable/weight only); render-time validation raises `E_OVERLAY_INCOMPATIBLE` and keeps the current configuration active. |
@@ -454,3 +492,15 @@ Revision 3 aligns investment with product evidence:
   diagnostic evidence rather than permission to permanently disable an engine.
 - Preserves configuration recovery requirements and makes retention subordinate to live,
   state, and journal references. No new runtime feature is implemented by this revision.
+
+Revision 4 records the 0.5.0 harness port:
+
+- Moves the support line to DeepSeek Harness `0.2.1-rc.2` and drops the `0.1.x` line. The
+  milestone numbering above is unchanged; M1/M2 remain the shipped `0.4.0` scope.
+- Adopts volatile settings: every config field is read at operation time, so a settings edit
+  applies to the next search without a remount. `mode` becomes the explicit deployment posture.
+- Makes `setup` mode-explicit (`--url` or `--managed`) rather than self-provisioning by default.
+- Adds the bundle-mount guard: the config row is only written when the plugin's bundle layer
+  provably inserts the entry it targets.
+- Applies `maxResults` inside the provider and pins the install spec to the running package
+  version.
